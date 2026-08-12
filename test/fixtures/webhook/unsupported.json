@@ -1,0 +1,19 @@
+{
+  "event_name": "message.sticker.received",
+  "message": {
+    "message_id": "c3d4e5f60718293a4b5c6d7e",
+    "from": {
+      "id": "8891234567890123456",
+      "name": "Minh Nguyen"
+    },
+    "chat": {
+      "id": "7009876543210987654",
+      "chat_type": "PRIVATE"
+    },
+    "date": 1752854520,
+    "sticker": {
+      "id": "12097",
+      "category": 1
+    }
+  }
+}

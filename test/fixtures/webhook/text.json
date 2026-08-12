@@ -1,0 +1,18 @@
+{
+  "event_name": "message.text.received",
+  "app_id": "zalo_app_redacted",
+  "message": {
+    "message_id": "a1b2c3d4e5f60718293a4b5c",
+    "from": {
+      "id": "8891234567890123456",
+      "name": "Minh Nguyen",
+      "avatar": "https://s120-ava-talk.zadn.vn/redacted.jpg"
+    },
+    "chat": {
+      "id": "7009876543210987654",
+      "chat_type": "PRIVATE"
+    },
+    "date": 1752854400,
+    "text": "cà phê 35k"
+  }
+}

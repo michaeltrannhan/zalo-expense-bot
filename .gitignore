@@ -1,0 +1,10 @@
+# Local state
+.env
+data/
+*.log
+
+# Binaries
+bin/
+
+# OS
+.DS_Store

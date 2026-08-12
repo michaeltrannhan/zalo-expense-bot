@@ -1,0 +1,11 @@
+{
+  "event_name": "message.text.received",
+  "message": {
+    "chat": {
+      "id": "7009876543210987654",
+      "chat_type": "PRIVATE"
+    },
+    "date": 1752854580,
+    "text": "tin nhắn thiếu định danh"
+  }
+}

@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Sổ Nhỏ · Local bot playground</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Sổ Nhỏ local lab">
+      <span class="brand-mark" aria-hidden="true">₫</span>
+      <span><strong>Sổ Nhỏ</strong><small>local lab</small></span>
+    </a>
+    <div class="environment" aria-live="polite">
+      <span class="status-dot" id="health-dot"></span>
+      <span id="health-text">Đang nối PostgreSQL…</span>
+      <span class="local-only">127.0.0.1 · mock OCR</span>
+    </div>
+  </header>
+
+  <main class="workbench">
+    <aside class="settings-panel" aria-labelledby="settings-title">
+      <div class="panel-heading">
+        <p class="eyebrow">Phiên thử</p>
+        <h1 id="settings-title">Cài đặt đang dùng</h1>
+        <button class="text-button" id="new-session" type="button">Tạo người dùng mới</button>
+      </div>
+
+      <dl class="profile-grid">
+        <div><dt>Trạng thái</dt><dd id="profile-status">Chưa bắt đầu</dd></div>
+        <div><dt>Phiên</dt><dd class="mono" id="session-label">—</dd></div>
+        <div><dt>Múi giờ</dt><dd id="profile-timezone">Asia/Ho_Chi_Minh</dd></div>
+        <div><dt>Tiền tệ</dt><dd id="profile-currency">VND</dd></div>
+      </dl>
+
+      <form id="settings-form" class="settings-form">
+        <label for="timezone">Múi giờ</label>
+        <select id="timezone" name="timezone">
+          <option>Asia/Ho_Chi_Minh</option>
+          <option>Asia/Bangkok</option>
+          <option>UTC</option>
+          <option>Australia/Sydney</option>
+          <option>America/New_York</option>
+        </select>
+
+        <label for="currency">Tiền tệ mặc định</label>
+        <select id="currency" name="currency">
+          <option>VND</option>
+          <option>USD</option>
+          <option>AUD</option>
+          <option>JPY</option>
+          <option>KRW</option>
+        </select>
+        <button class="primary-button" type="submit">Lưu cài đặt</button>
+      </form>
+
+      <section class="schedule-block" aria-labelledby="schedule-title">
+        <div class="section-title-row">
+          <h2 id="schedule-title">Tổng kết tự động</h2>
+          <button class="command-link" type="button" data-message="/tongket">Xem chi tiết</button>
+        </div>
+        <p id="schedule-status">Chưa bật lịch nào</p>
+        <div class="schedule-actions">
+          <button type="button" data-message="/tongket ngay 20:00">Ngày · 20:00</button>
+          <button type="button" data-message="/tongket tuan 08:00">Tuần · 08:00</button>
+          <button type="button" data-message="/tongket tat ca">Tắt tất cả</button>
+        </div>
+      </section>
+
+      <p class="privacy-note"><span aria-hidden="true">◎</span> Chỉ chạy trên máy này. Trình thử không gọi Zalo, Gemini hay AWS.</p>
+    </aside>
+
+    <section class="chat-stage" aria-labelledby="chat-title">
+      <div class="stage-heading">
+        <div>
+          <p class="eyebrow">Cuộc trò chuyện thật</p>
+          <h2 id="chat-title">Gửi lệnh như trên Zalo</h2>
+        </div>
+        <span class="queue-badge" id="queue-badge">sẵn sàng</span>
+      </div>
+
+      <div class="receipt-wrap">
+        <div class="receipt-top" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div id="transcript" class="transcript" role="log" aria-live="polite" aria-relevant="additions">
+          <div class="empty-state" id="empty-state">
+            <span class="receipt-stamp" aria-hidden="true">LOCAL</span>
+            <h3>Một người dùng sạch đã sẵn sàng.</h3>
+            <p>Bắt đầu onboarding, rồi thử cài đặt, nhập tay hoặc một hóa đơn mẫu.</p>
+            <button class="primary-button" type="button" data-message="/batdau">Bắt đầu với /batdau</button>
+          </div>
+        </div>
+        <form id="composer" class="composer">
+          <label class="sr-only" for="message">Tin nhắn gửi bot</label>
+          <input id="message" name="message" autocomplete="off" maxlength="2000" placeholder='Ví dụ: 150000 ăn trưa' required>
+          <button type="submit" aria-label="Gửi tin nhắn">Gửi <span aria-hidden="true">↗</span></button>
+        </form>
+        <div class="receipt-edge" aria-hidden="true"></div>
+      </div>
+
+      <nav class="quick-commands" aria-label="Lệnh thử nhanh">
+        <button type="button" data-message="/caidat">/caidat</button>
+        <button type="button" data-message="150000 ăn trưa">150k ăn trưa</button>
+        <button type="button" data-message="xác nhận">xác nhận</button>
+        <button type="button" data-message="/homnay">/homnay</button>
+        <button type="button" data-message="/ganday">/ganday</button>
+      </nav>
+    </section>
+
+    <aside class="fixture-panel" aria-labelledby="fixtures-title">
+      <div class="panel-heading fixture-heading">
+        <p class="eyebrow">Mock extraction corpus</p>
+        <h2 id="fixtures-title">Hóa đơn thử</h2>
+        <p>Chọn một mẫu để chạy đủ hàng đợi: nhận ảnh → đọc → phân loại → thẻ xác nhận.</p>
+      </div>
+      <div class="fixture-list">
+        <button class="fixture-card" type="button" data-fixture="coopmart-clean">
+          <span class="fixture-icon">01</span><span><strong>Co.opmart</strong><small>325.000 ₫ · rõ nét</small></span><span class="risk good">clean</span>
+        </button>
+        <button class="fixture-card" type="button" data-fixture="guardian-low-total">
+          <span class="fixture-icon">02</span><span><strong>Guardian</strong><small>tổng tiền tin cậy thấp</small></span><span class="risk warn">flag</span>
+        </button>
+        <button class="fixture-card" type="button" data-fixture="shopee-refund">
+          <span class="fixture-icon">03</span><span><strong>Shopee</strong><small>hoàn tiền</small></span><span class="risk info">refund</span>
+        </button>
+        <button class="fixture-card" type="button" data-fixture="vietcombank-transfer">
+          <span class="fixture-icon">04</span><span><strong>Vietcombank</strong><small>chuyển khoản</small></span><span class="risk info">transfer</span>
+        </button>
+        <button class="fixture-card" type="button" data-fixture="woolworths-aud">
+          <span class="fixture-icon">05</span><span><strong>Woolworths</strong><small>AUD · đa tiền tệ</small></span><span class="risk good">AUD</span>
+        </button>
+        <button class="fixture-card" type="button" data-fixture="coffeehouse-multi-total">
+          <span class="fixture-icon">06</span><span><strong>The Coffee House</strong><small>nhiều dòng tổng</small></span><span class="risk warn">edge</span>
+        </button>
+        <details class="more-fixtures">
+          <summary>Thêm 4 mẫu</summary>
+          <button type="button" data-fixture="highlands-clean">Highlands · clean</button>
+          <button type="button" data-fixture="petrolimex-clean">Petrolimex · clean</button>
+          <button type="button" data-fixture="grab-mid">Grab · medium confidence</button>
+          <button type="button" data-fixture="not-a-receipt">Ảnh không phải hóa đơn</button>
+        </details>
+      </div>
+    </aside>
+  </main>
+
+  <template id="message-template">
+    <article class="chat-message">
+      <header><span class="speaker"></span><time></time></header>
+      <p></p>
+    </article>
+  </template>
+</body>
+</html>

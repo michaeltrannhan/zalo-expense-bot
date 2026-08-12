@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: zl_expense
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d zl_expense"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/zl_expense?sslmode=disable
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/zl_expense?sslmode=disable
+      ZALO_WEBHOOK_SECRET: ci-only-secret
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      - name: Unit tests
+        run: go test -count=1 ./...
+      - name: Integration tests
+        run: go test -p 1 -count=1 -tags integration ./...
+      - name: Race integration tests
+        run: go test -p 1 -race -count=1 -tags integration ./...
+      - name: Build
+        run: go build ./...
+      - name: Deterministic simulation
+        env:
+          EXTRACTION_ENABLED: "true"
+          OUTBOUND_ENABLED: "true"
+        run: go run ./cmd/simulate
