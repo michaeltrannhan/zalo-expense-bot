@@ -4,7 +4,11 @@
 set -eu
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
-USER_NAME=$(id -un)
+USER_NAME=${SUDO_USER:-$(id -un)}
+if [ "$USER_NAME" = root ]; then
+	USER_NAME=ubuntu
+fi
+chmod +x "$ROOT/scripts/run-with-env.sh"
 
 if [ ! -f "$ROOT/.env" ]; then
 	echo "install-vm-services: $ROOT/.env is missing (copy .env.example first)" >&2

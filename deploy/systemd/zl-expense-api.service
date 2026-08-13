@@ -8,9 +8,8 @@ Type=simple
 User=@USER@
 Group=@USER@
 WorkingDirectory=@ROOT@
-EnvironmentFile=@ROOT@/.env
 # Drop "-poll" after Caddy terminates HTTPS at /webhook/zalo.
-ExecStart=@ROOT@/bin/api -poll
+ExecStart=@ROOT@/scripts/run-with-env.sh @ROOT@/bin/api -poll
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true
