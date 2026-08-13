@@ -281,3 +281,4 @@ Ctrl-C stops all three processes cleanly. Logs are JSON on stdout;
 Next milestones: complete the in-repository critical-fix checkpoints, then
 AWS deploy + real-OCR evaluation on a larger corpus (Phase 3 gate), followed
 by pilot load and restoration drills (Phase 5).
+# zalo-expense-bot
