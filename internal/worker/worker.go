@@ -16,8 +16,8 @@ import (
 
 // Handler processes one claimed job. Returning a *domain.Error with
 // CodeTransient Nacks the job (exponential backoff, dead-letter after
-// max attempts); any nil or permanent error Acks it — permanent failures
-// must be persisted by the handler itself before returning nil.
+// max attempts). Returning nil Acks it. Permanent errors also Ack — the
+// handler must persist a durable terminal outcome or return CodeTransient.
 type Handler func(ctx context.Context, job *domain.QueueJob) error
 
 // Config tunes one runner.
@@ -79,30 +79,64 @@ func loop(ctx context.Context, log *slog.Logger, q queue.Queue, cfg Config, hand
 			continue
 		}
 
-		handleErr := handle(ctx, job)
+		handleErr := runWithHeartbeat(ctx, q, job, cfg.Visibility, handle)
 		switch {
 		case handleErr == nil:
-			if err := q.Ack(ctx, job.ID); err != nil {
-				log.Error("ack failed", slog.String("job_id", job.ID.String()), slog.String("error", err.Error()))
+			if err := q.Ack(ctx, job.ID, job.ClaimToken); err != nil {
+				if !errors.Is(err, queue.ErrStaleClaim) {
+					log.Error("ack failed", slog.String("job_id", job.ID.String()), slog.String("error", err.Error()))
+				}
 			}
 		case domain.Retryable(handleErr):
 			log.Warn("job failed transiently",
 				slog.String("job_id", job.ID.String()),
 				slog.String("kind", string(job.Kind)),
 				slog.String("error_class", string(domain.CodeOf(handleErr))))
-			if err := q.Nack(ctx, job.ID, handleErr); err != nil {
-				log.Error("nack failed", slog.String("job_id", job.ID.String()), slog.String("error", err.Error()))
+			if err := q.Nack(ctx, job.ID, job.ClaimToken, handleErr); err != nil {
+				if !errors.Is(err, queue.ErrStaleClaim) {
+					log.Error("nack failed", slog.String("job_id", job.ID.String()), slog.String("error", err.Error()))
+				}
 			}
 		default:
-			// Permanent error without persisted outcome: Nack would retry
-			// forever, so Ack and rely on the handler's own records.
+			// Permanent error with a persisted outcome: Ack. Receipt jobs
+			// convert non-durable permanent failures to CodeTransient first.
 			log.Error("job failed permanently",
 				slog.String("job_id", job.ID.String()),
 				slog.String("kind", string(job.Kind)),
 				slog.String("error", handleErr.Error()))
-			if err := q.Ack(ctx, job.ID); err != nil {
-				log.Error("ack failed", slog.String("job_id", job.ID.String()), slog.String("error", err.Error()))
+			if err := q.Ack(ctx, job.ID, job.ClaimToken); err != nil {
+				if !errors.Is(err, queue.ErrStaleClaim) {
+					log.Error("ack failed", slog.String("job_id", job.ID.String()), slog.String("error", err.Error()))
+				}
 			}
 		}
 	}
+}
+
+// runWithHeartbeat renews the claim lease while handle runs so long OCR or
+// network work cannot expire visibility and let a second worker steal the job.
+func runWithHeartbeat(ctx context.Context, q queue.Queue, job *domain.QueueJob, visibility time.Duration, handle Handler) error {
+	hbCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	interval := visibility / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-hbCtx.Done():
+				return
+			case <-ticker.C:
+				if err := q.Heartbeat(hbCtx, job.ID, job.ClaimToken, visibility); err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	return handle(ctx, job)
 }

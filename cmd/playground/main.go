@@ -342,10 +342,10 @@ func (s *playgroundServer) drainKind(ctx context.Context, kind domain.JobKind, h
 		}
 		count++
 		if err := handle(ctx, job); err != nil {
-			_ = s.q.Nack(ctx, job.ID, err)
+			_ = s.q.Nack(ctx, job.ID, job.ClaimToken, err)
 			return count, err
 		}
-		if err := s.q.Ack(ctx, job.ID); err != nil {
+		if err := s.q.Ack(ctx, job.ID, job.ClaimToken); err != nil {
 			return count, err
 		}
 	}

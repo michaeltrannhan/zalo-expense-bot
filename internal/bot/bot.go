@@ -40,6 +40,10 @@ const pendingTTL = 24 * time.Hour
 // lease it can recover a process crash.
 const inboundClaimLease = 2 * time.Minute
 
+// redactedPayload is stored for allowlist rejects and pre-consent messages so
+// text/media URLs never persist before authorization.
+var redactedPayload = []byte(`{"redacted":true}`)
+
 // Handler routes normalised inbound events.
 type Handler struct {
 	st       *store.Store
@@ -66,6 +70,24 @@ func NewHandler(st *store.Store, pool *pgxpool.Pool, q queue.Queue, objects obje
 // HandleEvent processes one inbound event end to end. Completed provider
 // duplicates are absorbed; failed or abandoned attempts are safely reclaimed.
 func (h *Handler) HandleEvent(ctx context.Context, ev events.InboundEvent) error {
+	raw := ev.RawPayload
+	opts := store.ClaimProviderMessageOpts{}
+	if !h.cfg.Allowlisted(ev.ProviderUserID) {
+		// Never persist text/media for rejected senders; keep the original
+		// hash so retries remain idempotent.
+		raw = redactedPayload
+	} else {
+		existing, err := h.st.GetUserByIdentity(ctx, domain.ProviderZaloBot, ev.ProviderUserID, zaloScope)
+		switch {
+		case err == nil && existing.Status == domain.UserPending && !isConsentRelated(ev):
+			opts.Redact = true
+		case domain.IsCode(err, domain.CodeNotFound) && !isConsentRelated(ev):
+			// First contact creates a pending user; redact in the same claim TX.
+			opts.Redact = true
+		case err != nil && !domain.IsCode(err, domain.CodeNotFound):
+			return err
+		}
+	}
 	pm := &domain.ProviderMessage{
 		ID:                uuid.New(),
 		Provider:          domain.Provider(ev.Provider),
@@ -73,10 +95,10 @@ func (h *Handler) HandleEvent(ctx context.Context, ev events.InboundEvent) error
 		ProviderMessageID: ev.ProviderMessageID,
 		EventType:         ev.EventType,
 		PayloadHash:       ev.RawPayloadHash,
-		RawPayload:        ev.RawPayload,
+		RawPayload:        raw,
 		ReceivedAt:        ev.ReceivedAt,
 	}
-	claimed, err := h.st.ClaimProviderMessage(ctx, pm, inboundClaimLease)
+	claimed, err := h.st.ClaimProviderMessageOpts(ctx, pm, inboundClaimLease, opts)
 	if err != nil {
 		return err
 	}
@@ -128,11 +150,14 @@ func (h *Handler) route(ctx context.Context, ev events.InboundEvent, pm *domain.
 		if err != nil {
 			return err
 		}
-		if lockedUser.Status == domain.UserDeleted || lockedUser.DeletedAt != nil {
+		if lockedUser.Status == domain.UserDeleted || lockedUser.Status == domain.UserDeleting || lockedUser.DeletedAt != nil {
 			return nil
 		}
 
 		if !h.cfg.Allowlisted(ev.ProviderUserID) {
+			if rerr := h.st.RedactProviderMessageRaw(lockedCtx, pm.ID); rerr != nil {
+				h.log.Warn("redact rejected-sender payload failed", slog.Any("error", rerr))
+			}
 			return h.reply(lockedCtx, lockedUser.ID, ev, conversation.NotAllowedText(), "allow:"+pm.ID.String())
 		}
 
@@ -154,9 +179,9 @@ func (h *Handler) route(ctx context.Context, ev events.InboundEvent, pm *domain.
 	})
 }
 
-// resolveUser loads or creates the user behind a provider subject. The
-// identity UNIQUE constraint turns concurrent first messages into a
-// conflict retry, never two users.
+// resolveUser loads or creates the user behind a provider subject. User and
+// identity are inserted in one transaction so a concurrent first contact
+// cannot leave an orphan users row.
 func (h *Handler) resolveUser(ctx context.Context, ev events.InboundEvent) (*domain.User, error) {
 	user, err := h.st.GetUserByIdentity(ctx, domain.ProviderZaloBot, ev.ProviderUserID, zaloScope)
 	if err == nil {
@@ -166,19 +191,27 @@ func (h *Handler) resolveUser(ctx context.Context, ev events.InboundEvent) (*dom
 		return nil, err
 	}
 	userID := uuid.New()
-	if err := h.st.CreateUser(ctx, userID); err != nil {
-		return nil, err
+	user, err = h.st.CreateUserWithIdentity(ctx, userID, domain.ProviderZaloBot, ev.ProviderUserID, zaloScope)
+	if err == nil {
+		return user, nil
 	}
-	if _, err := h.st.CreateIdentity(ctx, userID, domain.ProviderZaloBot, ev.ProviderUserID, zaloScope); err != nil {
-		if domain.IsCode(err, domain.CodeConflict) || domain.IsCode(err, domain.CodeInternal) {
-			// Concurrent first contact won the identity race; re-resolve.
-			if user, rerr := h.st.GetUserByIdentity(ctx, domain.ProviderZaloBot, ev.ProviderUserID, zaloScope); rerr == nil {
-				return user, nil
-			}
-		}
-		return nil, err
+	if domain.IsCode(err, domain.CodeConflict) {
+		return h.st.GetUserByIdentity(ctx, domain.ProviderZaloBot, ev.ProviderUserID, zaloScope)
 	}
-	return h.st.GetUser(ctx, userID)
+	return nil, err
+}
+
+// isConsentRelated reports intents that pending users may send without
+// redacting the stored payload (consent confirm, start, privacy).
+func isConsentRelated(ev events.InboundEvent) bool {
+	if ev.EventType != domain.EventTextReceived {
+		return false
+	}
+	switch conversation.Parse(ev.Text).Kind {
+	case conversation.IntentConfirm, conversation.IntentStart, conversation.IntentPrivacy:
+		return true
+	}
+	return false
 }
 
 // consentFlow gates pending users: only consent and privacy queries work

@@ -19,6 +19,7 @@ import (
 	"zl-expese-bot/internal/extraction/normalise"
 	"zl-expese-bot/internal/insight"
 	"zl-expese-bot/internal/platform/queue"
+	"zl-expese-bot/internal/store"
 	"zl-expese-bot/internal/summaryschedule"
 )
 
@@ -372,7 +373,7 @@ func (h *Handler) requestDeleteRecent(ctx context.Context, user *domain.User, ev
 
 // manualEntry persists "150000 ăn trưa"-style entries as suggestions going
 // through the same confirmation card as receipts.
-func (h *Handler) manualEntry(ctx context.Context, user *domain.User, ev events.InboundEvent, intent conversation.Intent) error {
+func (h *Handler) manualEntry(ctx context.Context, user *domain.User, ev events.InboundEvent, intent conversation.Intent, pm *domain.ProviderMessage) error {
 	amountMinor, currency, err := normalise.ParseAmount(intent.AmountText, user.DefaultCurrency)
 	if err != nil {
 		return err
@@ -411,20 +412,21 @@ func (h *Handler) manualEntry(ctx context.Context, user *domain.User, ev events.
 		Version:           1,
 		CreatedAt:         now, UpdatedAt: now,
 	}
-	if err := h.st.CreateTransaction(ctx, tx); err != nil {
-		return err
-	}
-	_ = h.st.InsertPredictions(ctx, []domain.Prediction{
-		{ID: uuid.New(), TransactionID: tx.ID, PredictionType: "category",
-			PredictedValue: sug.CategoryKey, Confidence: sug.Confidence,
-			ModelName: sug.Source, ModelVersion: "v1", CreatedAt: now},
-		{ID: uuid.New(), TransactionID: tx.ID, PredictionType: "type",
-			PredictedValue: string(txType), Confidence: typeConf,
-			ModelName: typeSource, ModelVersion: "v1", CreatedAt: now},
-	})
-	if err := h.st.SetPendingAction(ctx, &domain.PendingAction{
-		UserID: user.ID, Kind: domain.PendingConfirmExtraction, TransactionID: &tx.ID,
-		ExpiresAt: now.Add(pendingTTL),
+	if err := h.st.CreateManualDraft(ctx, store.ManualDraftBundle{
+		Transaction:       tx,
+		ProviderMessageID: &pm.ID,
+		Predictions: []domain.Prediction{
+			{ID: uuid.New(), TransactionID: tx.ID, PredictionType: "category",
+				PredictedValue: sug.CategoryKey, Confidence: sug.Confidence,
+				ModelName: sug.Source, ModelVersion: "v1", CreatedAt: now},
+			{ID: uuid.New(), TransactionID: tx.ID, PredictionType: "type",
+				PredictedValue: string(txType), Confidence: typeConf,
+				ModelName: typeSource, ModelVersion: "v1", CreatedAt: now},
+		},
+		Pending: &domain.PendingAction{
+			UserID: user.ID, Kind: domain.PendingConfirmExtraction, TransactionID: &tx.ID,
+			ExpiresAt: now.Add(pendingTTL),
+		},
 	}); err != nil {
 		return err
 	}

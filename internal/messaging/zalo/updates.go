@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -26,10 +27,12 @@ type update struct {
 }
 
 // GetUpdates long-polls the Bot API and normalises each update with the
-// same mapping as ParseWebhook. nextOffset is max(update_id)+1, or the
-// incoming offset when the result is empty. A long-poll "Request timeout"
-// from the API is normal (no updates within the hold window) and is
-// treated as an empty result, not an error.
+// same mapping as ParseWebhook. nextOffset is max(update_id)+1 among
+// successfully parsed and skipped-malformed entries, or the incoming
+// offset when the result is empty. A long-poll "Request timeout" from the
+// API is normal (no updates within the hold window) and is treated as an
+// empty result, not an error. One malformed entry is quarantined (logged
+// and skipped) so it cannot block the batch forever.
 func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]events.InboundEvent, int64, error) {
 	if c.token == "" {
 		return nil, offset, domain.E(domain.CodeValidation, "zalo bot token not configured", nil)
@@ -92,10 +95,23 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]events.Inbound
 	}
 	evs := make([]events.InboundEvent, 0, len(updates))
 	next := offset
-	for _, raw := range updates {
+	advance := func(updateID int64) {
+		if updateID > 0 && updateID >= next {
+			next = updateID + 1
+		}
+	}
+	for _, rawEntry := range updates {
 		var u update
-		if err := json.Unmarshal(raw, &u); err != nil {
-			return nil, offset, domain.E(domain.CodeValidation, "invalid update entry", err)
+		if err := json.Unmarshal(rawEntry, &u); err != nil {
+			var probe struct {
+				UpdateID int64 `json:"update_id"`
+			}
+			_ = json.Unmarshal(rawEntry, &probe)
+			advance(probe.UpdateID)
+			slog.Warn("quarantined malformed getUpdates entry",
+				slog.Int64("update_id", probe.UpdateID),
+				slog.String("error", err.Error()))
+			continue
 		}
 		eventType := u.EventName
 		if eventType == "" {
@@ -103,14 +119,17 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64) ([]events.Inbound
 		} else if eventType != domain.EventTextReceived && eventType != domain.EventImageReceived {
 			eventType = domain.EventUnsupported
 		}
-		ev, err := buildEvent(eventType, u.Message, raw)
+		ev, err := buildEvent(eventType, u.Message, rawEntry)
 		if err != nil {
-			return nil, offset, err
+			advance(u.UpdateID)
+			slog.Warn("quarantined invalid getUpdates entry",
+				slog.Int64("update_id", u.UpdateID),
+				slog.String("error", err.Error()))
+			continue
 		}
+		ev.ProviderUpdateID = u.UpdateID
 		evs = append(evs, ev)
-		if u.UpdateID > 0 && u.UpdateID >= next {
-			next = u.UpdateID + 1
-		}
+		advance(u.UpdateID)
 	}
 	return evs, next, nil
 }

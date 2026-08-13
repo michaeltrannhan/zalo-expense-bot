@@ -40,9 +40,8 @@ import (
 )
 
 // visibility bounds how long one receipt job may run before another lane
-// may retry it (crash recovery). One image stays well under this with the
-// mock extractor; revisit when a real OCR adapter lands.
-const visibility = 60 * time.Second
+// may retry it (crash recovery). Heartbeats renew this lease while OCR runs.
+const visibility = 5 * time.Minute
 
 func main() {
 	if err := run(); err != nil && !errors.Is(err, context.Canceled) {

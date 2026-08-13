@@ -227,6 +227,8 @@ func (s *server) healthz(w http.ResponseWriter, r *http.Request) {
 // pollLoop is the local-development ingress: the Bot API hands out updates
 // over getUpdates long polling instead of webhook calls. Events flow
 // through the same handler and dedupe path as the deployed webhook.
+// Offset advances only after every HandleEvent in the batch succeeds; on
+// the first failure offset stays at that update's id so it is redelivered.
 func pollLoop(ctx context.Context, log *slog.Logger, client *zalo.Client, handler *bot.Handler) error {
 	log.Info("long-polling Zalo Bot API for updates")
 	var offset int64
@@ -244,14 +246,22 @@ func pollLoop(ctx context.Context, log *slog.Logger, client *zalo.Client, handle
 			}
 			continue
 		}
-		offset = next
+		failed := false
 		for _, ev := range evs {
 			evCtx := logging.WithRequestID(ctx, uuid.NewString())
 			if err := handler.HandleEvent(evCtx, ev); err != nil {
 				log.Error("event handling failed", slog.String("error", err.Error()))
+				if ev.ProviderUpdateID > 0 {
+					offset = ev.ProviderUpdateID
+				}
+				failed = true
+				break
 			}
 		}
-		if len(evs) == 0 {
+		if !failed {
+			offset = next
+		}
+		if len(evs) == 0 || failed {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()

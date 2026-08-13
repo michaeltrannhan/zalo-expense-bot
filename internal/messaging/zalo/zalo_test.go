@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -572,7 +573,39 @@ func TestGetUpdatesScalarResultFails(t *testing.T) {
 	}
 }
 
+func TestGetUpdatesSkipsMalformedEntries(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"ok":true,"result":[
+			{"update_id":10,"event_name":"message.text.received","message":{"message_id":"m1","from":{"id":"u1"},"chat":{"id":"c1"},"text":"ok"}},
+			{"update_id":11,"event_name":"message.text.received","message":"not-an-object"},
+			{"update_id":12,"event_name":"message.text.received","message":{"message_id":"m3","from":{"id":"u3"},"chat":{"id":"c3"},"text":"still ok"}}
+		]}`)
+	}))
+	defer srv.Close()
+	c := New(Config{Token: "T0K3N", APIBase: srv.URL})
+	evs, next, err := c.GetUpdates(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("GetUpdates: %v", err)
+	}
+	if len(evs) != 2 {
+		t.Fatalf("got %d events, want 2 good ones", len(evs))
+	}
+	if evs[0].ProviderMessageID != "m1" || evs[1].ProviderMessageID != "m3" {
+		t.Fatalf("events = %+v", evs)
+	}
+	if evs[0].ProviderUpdateID != 10 || evs[1].ProviderUpdateID != 12 {
+		t.Fatalf("update ids = %d,%d", evs[0].ProviderUpdateID, evs[1].ProviderUpdateID)
+	}
+	if next != 13 {
+		t.Fatalf("next = %d, want 13 (past malformed update_id 11)", next)
+	}
+}
+
 func TestDownloadMedia(t *testing.T) {
+	bypassMediaCheck := func(c *Client) {
+		c.validateMedia = func(context.Context, string) error { return nil }
+	}
+
 	t.Run("ok with content type", func(t *testing.T) {
 		payload := []byte("fake jpeg bytes")
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -581,6 +614,7 @@ func TestDownloadMedia(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := New(Config{})
+		bypassMediaCheck(c)
 		rc, meta, err := c.DownloadMedia(context.Background(), mediaRef(srv.URL+"/f"))
 		if err != nil {
 			t.Fatalf("DownloadMedia: %v", err)
@@ -609,6 +643,7 @@ func TestDownloadMedia(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := New(Config{})
+		bypassMediaCheck(c)
 		rc, meta, err := c.DownloadMedia(context.Background(), mediaRef(srv.URL))
 		if err != nil {
 			t.Fatalf("DownloadMedia: %v", err)
@@ -625,6 +660,7 @@ func TestDownloadMedia(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := New(Config{})
+		bypassMediaCheck(c)
 		_, _, err := c.DownloadMedia(context.Background(), mediaRef(srv.URL))
 		if !domain.IsCode(err, domain.CodeValidation) {
 			t.Fatalf("err = %v, want CodeValidation", err)
@@ -640,6 +676,7 @@ func TestDownloadMedia(t *testing.T) {
 		srv := httptest.NewServer(mux)
 		defer srv.Close()
 		c := New(Config{})
+		bypassMediaCheck(c)
 		rc, _, err := c.DownloadMedia(context.Background(), mediaRef(srv.URL+"/a"))
 		if err != nil {
 			t.Fatalf("DownloadMedia: %v", err)
@@ -653,6 +690,7 @@ func TestDownloadMedia(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := New(Config{})
+		bypassMediaCheck(c)
 		_, _, err := c.DownloadMedia(context.Background(), mediaRef(srv.URL+"/r"))
 		if !domain.IsCode(err, domain.CodeValidation) {
 			t.Fatalf("err = %v, want CodeValidation", err)
@@ -665,6 +703,7 @@ func TestDownloadMedia(t *testing.T) {
 		}))
 		defer srv.Close()
 		c := New(Config{})
+		bypassMediaCheck(c)
 		_, _, err := c.DownloadMedia(context.Background(), mediaRef(srv.URL))
 		if !domain.IsCode(err, domain.CodeValidation) {
 			t.Fatalf("err = %v, want CodeValidation", err)
@@ -674,6 +713,76 @@ func TestDownloadMedia(t *testing.T) {
 	t.Run("empty url", func(t *testing.T) {
 		c := New(Config{})
 		_, _, err := c.DownloadMedia(context.Background(), mediaRef(""))
+		if !domain.IsCode(err, domain.CodeValidation) {
+			t.Fatalf("err = %v, want CodeValidation", err)
+		}
+	})
+}
+
+func TestValidateMediaURL(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("http scheme rejected", func(t *testing.T) {
+		err := validateMediaURL(ctx, "http://files.zdn.vn/photo.jpg")
+		if !domain.IsCode(err, domain.CodeValidation) {
+			t.Fatalf("err = %v, want CodeValidation", err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "https") {
+			t.Fatalf("err = %v, want https mention", err)
+		}
+	})
+
+	t.Run("localhost rejected", func(t *testing.T) {
+		err := validateMediaURL(ctx, "https://localhost/secret")
+		if !domain.IsCode(err, domain.CodeValidation) {
+			t.Fatalf("err = %v, want CodeValidation", err)
+		}
+	})
+
+	t.Run("private IP rejected", func(t *testing.T) {
+		for _, raw := range []string{
+			"https://127.0.0.1/x",
+			"https://10.0.0.1/x",
+			"https://192.168.1.1/x",
+			"https://169.254.169.254/latest/meta-data",
+		} {
+			err := validateMediaURL(ctx, raw)
+			if !domain.IsCode(err, domain.CodeValidation) {
+				t.Fatalf("%s: err = %v, want CodeValidation", raw, err)
+			}
+		}
+	})
+
+	t.Run("allowed host with private DNS rejected", func(t *testing.T) {
+		prev := mediaLookupIP
+		t.Cleanup(func() { mediaLookupIP = prev })
+		mediaLookupIP = func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP("10.1.2.3")}}, nil
+		}
+		err := validateMediaURL(ctx, "https://files.zdn.vn/photo.jpg")
+		if !domain.IsCode(err, domain.CodeValidation) {
+			t.Fatalf("err = %v, want CodeValidation", err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "forbidden") {
+			t.Fatalf("err = %v, want forbidden address", err)
+		}
+	})
+
+	t.Run("redirect to internal rejected", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "https://127.0.0.1/internal", http.StatusFound)
+		}))
+		defer srv.Close()
+		c := New(Config{})
+		calls := 0
+		c.validateMedia = func(ctx context.Context, raw string) error {
+			calls++
+			if calls == 1 {
+				return nil // allow initial httptest hop so CheckRedirect runs
+			}
+			return validateMediaURL(ctx, raw)
+		}
+		_, _, err := c.DownloadMedia(context.Background(), mediaRef(srv.URL+"/start"))
 		if !domain.IsCode(err, domain.CodeValidation) {
 			t.Fatalf("err = %v, want CodeValidation", err)
 		}

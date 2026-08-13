@@ -281,8 +281,8 @@ func TestDeleteAccountObjectFailureLeavesRetryableDatabaseState(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM receipt_documents WHERE user_id = $1`, userID).Scan(&receipts); err != nil {
 		t.Fatal(err)
 	}
-	if status == "deleted" || receipts != 1 {
-		t.Fatalf("database was partially deleted: status=%s receipts=%d", status, receipts)
+	if status != string(domain.UserDeleting) || receipts != 1 {
+		t.Fatalf("expected durable deleting saga state: status=%s receipts=%d", status, receipts)
 	}
 }
 

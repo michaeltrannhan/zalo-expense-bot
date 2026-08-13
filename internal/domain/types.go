@@ -29,6 +29,7 @@ const (
 	UserPending   UserStatus = "pending"   // seen, has not consented yet
 	UserActive    UserStatus = "active"    // consent recorded
 	UserSuspended UserStatus = "suspended" // administratively blocked
+	UserDeleting  UserStatus = "deleting"  // account deletion saga in progress
 	UserDeleted   UserStatus = "deleted"   // data deletion executed
 )
 
@@ -331,6 +332,7 @@ type QueueJob struct {
 	MaxAttempts int
 	RunAfter    time.Time
 	VisibleAt   time.Time // visibility timeout deadline
+	ClaimToken  uuid.UUID // ownership token for Ack/Nack/Heartbeat
 	LastError   string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time

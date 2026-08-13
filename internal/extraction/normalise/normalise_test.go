@@ -37,6 +37,11 @@ func TestParseAmount(t *testing.T) {
 		{"aud word", "18.90 AUD", "", 1890, "AUD"},
 		{"aud hint", "12.34", "AUD", 1234, "AUD"},
 		{"aud no decimal scales ×100", "50", "AUD", 5000, "AUD"},
+		{"usd integer scales ×100", "50", "USD", 5000, "USD"},
+		{"vnd integer no scale", "50", "VND", 50, "VND"},
+		{"usd cents from printed decimal", "12.34", "USD", 1234, "USD"},
+		{"aud cents from printed decimal", "12.34", "AUD", 1234, "AUD"},
+		{"vnd printed with dong ignores usd-style cents", "12.34", "VND", 1234, "VND"},
 		// Documented rule: only "." is a decimal point for 2-decimal
 		// currencies; a comma with 2 trailing digits stays thousands.
 		{"usd comma not decimal", "12,34", "USD", 123400, "USD"},

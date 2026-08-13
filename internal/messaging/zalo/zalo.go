@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -51,6 +52,9 @@ type Client struct {
 	secret string
 	base   string
 	http   *http.Client
+
+	// validateMedia, when set, replaces validateMediaURL (tests only).
+	validateMedia func(context.Context, string) error
 }
 
 var _ messaging.Provider = (*Client)(nil)
@@ -242,11 +246,15 @@ func (c *Client) Send(ctx context.Context, msg messaging.OutboundMessage) (messa
 
 // DownloadMedia fetches provider-hosted media with a 15s timeout, at most 3
 // redirects and a hard 10 MiB cap. The body is buffered (bounded by the cap)
-// so overflow is detected before returning.
+// so overflow is detected before returning. URLs are validated against an
+// HTTPS + Zalo CDN allowlist and resolved addresses are checked for SSRF.
 func (c *Client) DownloadMedia(ctx context.Context, ref events.MediaReference) (io.ReadCloser, messaging.MediaMetadata, error) {
 	var meta messaging.MediaMetadata
 	if ref.URL == "" {
 		return nil, meta, domain.E(domain.CodeValidation, "media reference has no URL", nil)
+	}
+	if err := c.checkMediaURL(ctx, ref.URL); err != nil {
+		return nil, meta, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, downloadTimeout)
 	defer cancel()
@@ -256,9 +264,12 @@ func (c *Client) DownloadMedia(ctx context.Context, ref events.MediaReference) (
 	}
 	hc := *c.http
 	hc.Timeout = 0 // bounded by ctx instead
-	hc.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
+	hc.CheckRedirect = func(r *http.Request, via []*http.Request) error {
 		if len(via) > maxRedirects {
 			return errors.New("redirect limit exceeded")
+		}
+		if err := c.checkMediaURL(r.Context(), r.URL.String()); err != nil {
+			return err
 		}
 		return nil
 	}
@@ -267,6 +278,13 @@ func (c *Client) DownloadMedia(ctx context.Context, ref events.MediaReference) (
 		var urlErr *url.Error
 		if errors.As(err, &urlErr) && strings.Contains(urlErr.Err.Error(), "redirect limit") {
 			return nil, meta, domain.E(domain.CodeValidation, "media redirect limit exceeded", c.safeCause(err))
+		}
+		if errors.As(err, &urlErr) && domain.IsCode(urlErr.Err, domain.CodeValidation) {
+			return nil, meta, urlErr.Err
+		}
+		var de *domain.Error
+		if errors.As(err, &de) {
+			return nil, meta, de
 		}
 		return nil, meta, domain.E(domain.CodeTransient, "media download failed", c.safeCause(err))
 	}
@@ -287,6 +305,95 @@ func (c *Client) DownloadMedia(ctx context.Context, ref events.MediaReference) (
 	}
 	meta.ByteSize = int64(len(buf))
 	return io.NopCloser(bytes.NewReader(buf)), meta, nil
+}
+
+func (c *Client) checkMediaURL(ctx context.Context, raw string) error {
+	if c.validateMedia != nil {
+		return c.validateMedia(ctx, raw)
+	}
+	return validateMediaURL(ctx, raw)
+}
+
+// mediaLookupIP resolves hostnames for media URL SSRF checks. Tests may
+// replace it to avoid real DNS.
+var mediaLookupIP = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return net.DefaultResolver.LookupIPAddr(ctx, host)
+}
+
+// allowedMediaHost reports whether host is a known Zalo CDN / media domain.
+func allowedMediaHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if host == "" {
+		return false
+	}
+	for _, suffix := range []string{
+		"zaloplatforms.com",
+		"zaloapp.com",
+		"zdn.vn",
+		"zadn.vn",
+		"zapps.me",
+	} {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+// forbiddenMediaIP reports addresses that must never be fetched (SSRF).
+func forbiddenMediaIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	// Explicit metadata / link-local ranges (covers IPv4 169.254.0.0/16).
+	if ip4 := ip.To4(); ip4 != nil {
+		if ip4[0] == 169 && ip4[1] == 254 {
+			return true
+		}
+	}
+	return false
+}
+
+// validateMediaURL enforces HTTPS, a Zalo CDN host allowlist, and rejects
+// resolutions to loopback/private/link-local/multicast/metadata addresses.
+func validateMediaURL(ctx context.Context, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return domain.E(domain.CodeValidation, "invalid media URL", err)
+	}
+	if u.Scheme != "https" {
+		return domain.E(domain.CodeValidation, "media URL must use https", nil)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return domain.E(domain.CodeValidation, "media URL missing host", nil)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if forbiddenMediaIP(ip) {
+			return domain.E(domain.CodeValidation, "media URL resolves to forbidden address", nil)
+		}
+		return domain.E(domain.CodeValidation, "media host not allowed", nil)
+	}
+	if !allowedMediaHost(host) {
+		return domain.E(domain.CodeValidation, "media host not allowed", nil)
+	}
+	addrs, err := mediaLookupIP(ctx, host)
+	if err != nil {
+		return domain.E(domain.CodeValidation, "media host DNS lookup failed", err)
+	}
+	if len(addrs) == 0 {
+		return domain.E(domain.CodeValidation, "media host DNS lookup returned no addresses", nil)
+	}
+	for _, a := range addrs {
+		if forbiddenMediaIP(a.IP) {
+			return domain.E(domain.CodeValidation, "media URL resolves to forbidden address", nil)
+		}
+	}
+	return nil
 }
 
 // classifyStatus maps an HTTP failure status onto a domain code: 429/5xx

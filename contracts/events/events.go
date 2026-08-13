@@ -24,6 +24,9 @@ type InboundEvent struct {
 	ReceivedAt        time.Time        `json:"received_at"`
 	RawPayloadHash    string           `json:"raw_payload_hash"`
 	RawPayload        []byte           `json:"-"` // stored in provider_messages only, never queued
+	// ProviderUpdateID is set for long-poll getUpdates entries so the
+	// poll loop can hold offset on handler failure. Zero for webhooks.
+	ProviderUpdateID int64 `json:"-"`
 }
 
 // MediaReference points at provider-hosted media. Image bytes never travel

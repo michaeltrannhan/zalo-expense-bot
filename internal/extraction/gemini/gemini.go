@@ -120,8 +120,8 @@ func (e *Extractor) Extract(ctx context.Context, r io.Reader, in extraction.Inpu
 	return e.mapResponse(respBody)
 }
 
-// buildRequest assembles the generateContent payload: image part + prompt,
-// temperature 0 and JSON response mode for stable machine output.
+// buildRequest assembles the generateContent payload: image part + prompt
+// with JSON response mode for stable machine output.
 func (e *Extractor) buildRequest(image []byte, mime string) ([]byte, error) {
 	req := generateRequest{
 		Contents: []content{{
@@ -132,7 +132,6 @@ func (e *Extractor) buildRequest(image []byte, mime string) ([]byte, error) {
 			},
 		}},
 		GenerationConfig: generationConfig{
-			Temperature:      0,
 			ResponseMimeType: "application/json",
 		},
 	}
@@ -183,8 +182,7 @@ type inlineData struct {
 }
 
 type generationConfig struct {
-	Temperature      float64 `json:"temperature"`
-	ResponseMimeType string  `json:"responseMimeType"`
+	ResponseMimeType string `json:"responseMimeType"`
 }
 
 type generateResponse struct {
@@ -261,13 +259,27 @@ func (e *Extractor) mapResponse(body []byte) (events.ExtractionResult, error) {
 	}
 	if ans.Total != nil && strings.TrimSpace(*ans.Total) != "" {
 		v := strings.TrimSpace(*ans.Total)
-		if minor, currency, err := normalise.ParseAmount(v, ""); err == nil {
-			res.Fields["total_minor"] = events.FieldValue{Raw: v, Normalised: minor, Confidence: conf("total")}
-			cur := currency
-			if ans.Currency != nil && strings.TrimSpace(*ans.Currency) != "" {
-				cur = strings.ToUpper(strings.TrimSpace(*ans.Currency))
+		declaredHint := ""
+		if ans.Currency != nil && strings.TrimSpace(*ans.Currency) != "" {
+			declaredHint = strings.ToUpper(strings.TrimSpace(*ans.Currency))
+		}
+		if minor, currency, err := normalise.ParseAmount(v, declaredHint); err == nil {
+			totalConf := conf("total")
+			curConf := conf("currency")
+			if declaredHint != "" && declaredHint != currency {
+				// Keep ParseAmount's currency (hint drove decimal places);
+				// lower confidence instead of overwriting without recalc.
+				if totalConf > 0.4 {
+					totalConf = 0.4
+				}
+				if curConf > 0.4 {
+					curConf = 0.4
+				}
+				res.Warnings = append(res.Warnings,
+					"currency mismatch: declared "+declaredHint+" vs parsed "+currency)
 			}
-			res.Fields["currency"] = events.FieldValue{Raw: v, Normalised: cur, Confidence: conf("currency")}
+			res.Fields["total_minor"] = events.FieldValue{Raw: v, Normalised: minor, Confidence: totalConf}
+			res.Fields["currency"] = events.FieldValue{Raw: v, Normalised: currency, Confidence: curConf}
 		}
 		// Unparseable total: emit nothing — the pipeline fails permanently
 		// rather than inventing a number (product principle).

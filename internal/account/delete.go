@@ -37,9 +37,13 @@ type Report struct {
 // payloads, receipts, derived records, analytics, message copies and local
 // CSV/JSON export artifacts are physically removed.
 //
-// Object deletion cannot join the database transaction. Objects are removed
-// first and any failure aborts the database purge, making the operation
-// safely retryable (successful object deletes are idempotent).
+// The saga is durable across retries:
+//  1. Tx1 marks status=deleting and lists object keys (FOR UPDATE).
+//  2. Outside the DB: delete objects and export artifacts (idempotent).
+//  3. Tx2 purges all user-linked rows and finalises the deleted tombstone.
+//
+// If already deleting on entry, Tx1 is skipped past the status flip and the
+// saga resumes at object cleanup + Tx2.
 func DeleteAccount(ctx context.Context, pool *pgxpool.Pool, objects objectstore.Store, dataDir string, userID, triggeringMessageID uuid.UUID) (Report, error) {
 	var report Report
 	err := postgres.WithUserLock(ctx, pool, userID, func(lockedCtx context.Context) error {
@@ -52,38 +56,67 @@ func DeleteAccount(ctx context.Context, pool *pgxpool.Pool, objects objectstore.
 
 func deleteAccountLocked(ctx context.Context, pool *pgxpool.Pool, objects objectstore.Store, dataDir string, userID, triggeringMessageID uuid.UUID) (Report, error) {
 	var report Report
+	var keys []string
+
 	err := postgres.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		var status string
 		var deletedAt *time.Time
 		err := tx.QueryRow(ctx,
-			`SELECT deleted_at FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&deletedAt)
+			`SELECT status, deleted_at FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&status, &deletedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.Ef(domain.CodeNotFound, nil, "user %s not found", userID)
 		}
 		if err != nil {
 			return domain.E(domain.CodeTransient, "load user for deletion", err)
 		}
-		if deletedAt != nil {
+		if deletedAt != nil || status == string(domain.UserDeleted) {
 			return domain.Ef(domain.CodeConflict, nil, "user %s already deleted", userID)
 		}
-
-		keys, err := receiptKeys(ctx, tx, userID)
-		if err != nil {
-			return err
-		}
-		if len(keys) > 0 && objects == nil {
-			return domain.E(domain.CodeTransient, "receipt object store unavailable during account deletion", nil)
-		}
-		for _, key := range keys {
-			if err := objects.Delete(ctx, key); err != nil {
-				return domain.Ef(domain.CodeTransient, err, "delete receipt object %s", key)
+		if status != string(domain.UserDeleting) {
+			if _, err := tx.Exec(ctx,
+				`UPDATE users SET status = 'deleting', updated_at = now() WHERE id = $1`, userID); err != nil {
+				return domain.E(domain.CodeTransient, "mark user deleting", err)
 			}
-			report.FilesRemoved++
 		}
-		exportsRemoved, err := removeExportArtifacts(dataDir, userID)
+		keys, err = receiptKeys(ctx, tx, userID)
+		return err
+	})
+	if err != nil {
+		return report, asDomain(err, "delete account mark deleting")
+	}
+
+	if len(keys) > 0 && objects == nil {
+		return report, domain.E(domain.CodeTransient, "receipt object store unavailable during account deletion", nil)
+	}
+	for _, key := range keys {
+		if err := objects.Delete(ctx, key); err != nil {
+			return report, domain.Ef(domain.CodeTransient, err, "delete receipt object %s", key)
+		}
+		report.FilesRemoved++
+	}
+	exportsRemoved, err := removeExportArtifacts(dataDir, userID)
+	if err != nil {
+		return report, domain.E(domain.CodeTransient, "delete account exports", err)
+	}
+	report.ExportsRemoved = exportsRemoved
+
+	err = postgres.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		var status string
+		var deletedAt *time.Time
+		err := tx.QueryRow(ctx,
+			`SELECT status, deleted_at FROM users WHERE id = $1 FOR UPDATE`, userID).Scan(&status, &deletedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.Ef(domain.CodeNotFound, nil, "user %s not found", userID)
+		}
 		if err != nil {
-			return domain.E(domain.CodeTransient, "delete account exports", err)
+			return domain.E(domain.CodeTransient, "reload user for purge", err)
 		}
-		report.ExportsRemoved = exportsRemoved
+		if deletedAt != nil || status == string(domain.UserDeleted) {
+			return domain.Ef(domain.CodeConflict, nil, "user %s already deleted", userID)
+		}
+		if status != string(domain.UserDeleting) {
+			return domain.Ef(domain.CodeConflict, nil, "user %s is not deleting", userID)
+		}
 
 		// Stop every not-yet-acknowledged job before deleting its source rows.
 		if report.JobsPurged, err = execCount(ctx, tx, `
@@ -199,13 +232,17 @@ func deleteAccountLocked(ctx context.Context, pool *pgxpool.Pool, objects object
 		return nil
 	})
 	if err != nil {
-		var de *domain.Error
-		if errors.As(err, &de) {
-			return report, de
-		}
-		return report, domain.E(domain.CodeTransient, "delete account transaction", err)
+		return report, asDomain(err, "delete account purge")
 	}
 	return report, nil
+}
+
+func asDomain(err error, fallback string) error {
+	var de *domain.Error
+	if errors.As(err, &de) {
+		return de
+	}
+	return domain.E(domain.CodeTransient, fallback, err)
 }
 
 func removeExportArtifacts(dataDir string, userID uuid.UUID) (int, error) {

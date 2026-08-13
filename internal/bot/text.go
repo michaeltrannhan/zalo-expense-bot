@@ -22,7 +22,9 @@ func (h *Handler) handleText(ctx context.Context, user *domain.User, ev events.I
 
 	if pa, err := h.st.GetPendingAction(ctx, user.ID); err == nil {
 		if !isSlashIntent(intent.Kind) {
-			if h.resolvePending(ctx, user, ev, pm, pa, intent) {
+			if handled, err := h.resolvePending(ctx, user, ev, pm, pa, intent); err != nil {
+				return err
+			} else if handled {
 				return nil
 			}
 		}
@@ -58,7 +60,7 @@ func (h *Handler) handleText(ctx context.Context, user *domain.User, ev events.I
 	case conversation.IntentSummarySchedule:
 		return h.summarySchedule(ctx, user, ev, intent)
 	case conversation.IntentManualEntry:
-		return h.manualEntry(ctx, user, ev, intent)
+		return h.manualEntry(ctx, user, ev, intent, pm)
 	case conversation.IntentRecategory:
 		return h.recategorise(ctx, user, ev, intent.CategoryText)
 	case conversation.IntentDeleteRecent:
@@ -91,8 +93,8 @@ func isSlashIntent(k conversation.IntentKind) bool {
 }
 
 // resolvePending interprets text against the user's open pending action.
-// true = handled. The pending slot is replaced or cleared as flows advance.
-func (h *Handler) resolvePending(ctx context.Context, user *domain.User, ev events.InboundEvent, pm *domain.ProviderMessage, pa *domain.PendingAction, intent conversation.Intent) bool {
+// handled=true means the reply was consumed by the pending flow.
+func (h *Handler) resolvePending(ctx context.Context, user *domain.User, ev events.InboundEvent, pm *domain.ProviderMessage, pa *domain.PendingAction, intent conversation.Intent) (bool, error) {
 	switch pa.Kind {
 	case domain.PendingConfirmExtraction:
 		return h.resolveConfirm(ctx, user, ev, pa, intent)
@@ -104,23 +106,21 @@ func (h *Handler) resolvePending(ctx context.Context, user *domain.User, ev even
 	case domain.PendingDeleteRecent:
 		return h.resolveDeleteRecent(ctx, user, ev, pa, intent)
 	}
-	return false
+	return false, nil
 }
 
 // resolveConfirm handles replies to the extraction card.
-func (h *Handler) resolveConfirm(ctx context.Context, user *domain.User, ev events.InboundEvent, pa *domain.PendingAction, intent conversation.Intent) bool {
+func (h *Handler) resolveConfirm(ctx context.Context, user *domain.User, ev events.InboundEvent, pa *domain.PendingAction, intent conversation.Intent) (bool, error) {
 	txID := pa.TransactionID
 	if txID == nil {
 		_ = h.st.ClearPendingAction(ctx, user.ID)
-		return false
+		return false, nil
 	}
 	switch intent.Kind {
 	case conversation.IntentConfirm:
-		h.must(h.confirmTx(ctx, user, ev, *txID))
-		return true
+		return true, h.confirmTx(ctx, user, ev, *txID)
 	case conversation.IntentDiscard:
-		h.must(h.discardTx(ctx, user, ev, *txID))
-		return true
+		return true, h.discardTx(ctx, user, ev, *txID)
 	case conversation.IntentEditTotal, conversation.IntentEditMerchant,
 		conversation.IntentEditDate, conversation.IntentEditCategory,
 		conversation.IntentEditType:
@@ -137,38 +137,34 @@ func (h *Handler) resolveConfirm(ctx context.Context, user *domain.User, ev even
 			UserID: user.ID, Kind: kind, TransactionID: txID,
 			ExpiresAt: h.clk.Now().Add(pendingTTL),
 		}); err != nil {
-			h.log.Warn("set pending edit failed", slog.Any("error", err))
+			return true, err
 		}
-		h.must(h.reply(ctx, user.ID, ev, prompt, "editp:"+ev.ProviderMessageID))
-		return true
+		return true, h.reply(ctx, user.ID, ev, prompt, "editp:"+ev.ProviderMessageID)
 	case conversation.IntentNone:
 		// Unrecognised reply to a card: re-show it rather than guessing.
-		h.must(h.reshowCard(ctx, user, ev, *txID))
-		return true
+		return true, h.reshowCard(ctx, user, ev, *txID)
 	}
-	return false
+	return false, nil
 }
 
 // resolveEdit applies one field correction, records it, and returns to the
 // confirmation card. The transaction must still be awaiting confirmation —
 // a confirmed transaction can only change through recategorise.
-func (h *Handler) resolveEdit(ctx context.Context, user *domain.User, ev events.InboundEvent, pa *domain.PendingAction) bool {
+func (h *Handler) resolveEdit(ctx context.Context, user *domain.User, ev events.InboundEvent, pa *domain.PendingAction) (bool, error) {
 	txID := pa.TransactionID
 	if txID == nil {
 		_ = h.st.ClearPendingAction(ctx, user.ID)
-		return false
+		return false, nil
 	}
 	tx, err := h.st.GetTransactionForUser(ctx, *txID, user.ID)
 	if err != nil || tx.Status != domain.TxAwaitingConfirmation {
 		_ = h.st.ClearPendingAction(ctx, user.ID)
-		h.must(h.reply(ctx, user.ID, ev, conversation.PendingExpiredText(), "stale:"+ev.ProviderMessageID))
-		return true
+		return true, h.reply(ctx, user.ID, ev, conversation.PendingExpiredText(), "stale:"+ev.ProviderMessageID)
 	}
 
 	text := strings.TrimSpace(ev.Text)
-	invalid := func() bool {
-		h.must(h.reply(ctx, user.ID, ev, conversation.EditInvalidText(pa.Kind), "editinv:"+ev.ProviderMessageID))
-		return true
+	invalid := func() (bool, error) {
+		return true, h.reply(ctx, user.ID, ev, conversation.EditInvalidText(pa.Kind), "editinv:"+ev.ProviderMessageID)
 	}
 
 	var field, predicted, corrected string
@@ -187,8 +183,7 @@ func (h *Handler) resolveEdit(ctx context.Context, user *domain.User, ev events.
 		}
 		merchant, _, err := h.cats.ResolveMerchant(ctx, text)
 		if err != nil {
-			h.must(err)
-			return true
+			return true, err
 		}
 		field, predicted = "merchant", tx.MerchantName
 		if merchant != nil {
@@ -226,8 +221,7 @@ func (h *Handler) resolveEdit(ctx context.Context, user *domain.User, ev events.
 	}
 
 	if err := h.st.UpdateTransaction(ctx, tx, tx.Version); err != nil {
-		h.must(err)
-		return true
+		return true, err
 	}
 	_ = h.st.InsertCorrection(ctx, &domain.Correction{
 		TransactionID: tx.ID, FieldName: field,
@@ -237,60 +231,51 @@ func (h *Handler) resolveEdit(ctx context.Context, user *domain.User, ev events.
 		UserID: user.ID, Kind: domain.PendingConfirmExtraction, TransactionID: txID,
 		ExpiresAt: h.clk.Now().Add(pendingTTL),
 	}); err != nil {
-		h.log.Warn("restore confirm pending failed", slog.Any("error", err))
+		return true, err
 	}
-	h.must(h.reshowCard(ctx, user, ev, *txID))
-	return true
+	return true, h.reshowCard(ctx, user, ev, *txID)
 }
 
 // resolveDelete executes or cancels account deletion.
-func (h *Handler) resolveDelete(ctx context.Context, user *domain.User, ev events.InboundEvent, pm *domain.ProviderMessage, pa *domain.PendingAction, intent conversation.Intent) bool {
+func (h *Handler) resolveDelete(ctx context.Context, user *domain.User, ev events.InboundEvent, pm *domain.ProviderMessage, pa *domain.PendingAction, intent conversation.Intent) (bool, error) {
 	if intent.Kind != conversation.IntentConfirm {
 		_ = h.st.ClearPendingAction(ctx, user.ID)
-		h.must(h.reply(ctx, user.ID, ev, conversation.DiscardedText(), "delcancel:"+ev.ProviderMessageID))
-		return true
+		return true, h.reply(ctx, user.ID, ev, conversation.DiscardedText(), "delcancel:"+ev.ProviderMessageID)
 	}
 	report, err := h.deleteAccount(ctx, user.ID, pm.ID)
 	if err != nil {
-		h.must(err)
-		return true
+		return true, err
 	}
-	h.must(h.replies.DeletionConfirmation(ctx, user.ID, domain.Provider(ev.Provider), ev.ProviderChatID,
+	return true, h.replies.DeletionConfirmation(ctx, user.ID, domain.Provider(ev.Provider), ev.ProviderChatID,
 		conversation.DeletedText()+fmt.Sprintf("\n(%d giao dịch, %d ảnh đã xóa)", report.TransactionsDeleted, report.FilesRemoved),
-		"deleted:"+ev.ProviderMessageID))
-	return true
+		"deleted:"+ev.ProviderMessageID)
 }
 
 // resolveDeleteRecent executes or cancels individual transaction deletion.
 // Only the exact transaction shown in the prompt is ever deleted; anything
 // but an explicit confirm keeps it.
-func (h *Handler) resolveDeleteRecent(ctx context.Context, user *domain.User, ev events.InboundEvent, pa *domain.PendingAction, intent conversation.Intent) bool {
+func (h *Handler) resolveDeleteRecent(ctx context.Context, user *domain.User, ev events.InboundEvent, pa *domain.PendingAction, intent conversation.Intent) (bool, error) {
 	if intent.Kind != conversation.IntentConfirm {
 		_ = h.st.ClearPendingAction(ctx, user.ID)
-		h.must(h.reply(ctx, user.ID, ev, conversation.DeleteRecentCancelText(), "delrecentcancel:"+ev.ProviderMessageID))
-		return true
+		return true, h.reply(ctx, user.ID, ev, conversation.DeleteRecentCancelText(), "delrecentcancel:"+ev.ProviderMessageID)
 	}
 	if pa.TransactionID == nil {
 		_ = h.st.ClearPendingAction(ctx, user.ID)
-		h.must(h.reply(ctx, user.ID, ev, conversation.PendingExpiredText(), "stale:"+ev.ProviderMessageID))
-		return true
+		return true, h.reply(ctx, user.ID, ev, conversation.PendingExpiredText(), "stale:"+ev.ProviderMessageID)
 	}
 	txID := *pa.TransactionID
 	tx, err := h.st.GetTransactionForUser(ctx, txID, user.ID)
 	if err != nil {
 		_ = h.st.ClearPendingAction(ctx, user.ID)
-		h.must(h.reply(ctx, user.ID, ev, conversation.PendingExpiredText(), "stale:"+ev.ProviderMessageID))
-		return true
+		return true, h.reply(ctx, user.ID, ev, conversation.PendingExpiredText(), "stale:"+ev.ProviderMessageID)
 	}
 	if err := h.st.SoftDeleteTransaction(ctx, txID, user.ID); err != nil {
-		h.must(err)
-		return true
+		return true, err
 	}
 	_ = h.st.InsertCorrection(ctx, &domain.Correction{TransactionID: txID, Source: "chat_delete"})
 	_ = h.st.ClearPendingAction(ctx, user.ID)
-	h.must(h.reply(ctx, user.ID, ev, conversation.DeletedRecentText(
-		conversation.Money(tx.AmountMinor, tx.Currency), tx.MerchantName), "delrecent:"+txID.String()))
-	return true
+	return true, h.reply(ctx, user.ID, ev, conversation.DeletedRecentText(
+		conversation.Money(tx.AmountMinor, tx.Currency), tx.MerchantName), "delrecent:"+txID.String())
 }
 
 // confirmTx finalises a suggested transaction and feeds the learning rule.
@@ -341,7 +326,10 @@ func (h *Handler) confirmTx(ctx context.Context, user *domain.User, ev events.In
 func (h *Handler) discardTx(ctx context.Context, user *domain.User, ev events.InboundEvent, txID uuid.UUID) error {
 	tx, err := h.st.GetTransactionForUser(ctx, txID, user.ID)
 	if err == nil && tx.ReceiptDocumentID != nil {
-		_ = h.st.TransitionReceipt(ctx, *tx.ReceiptDocumentID, domain.ReceiptReviewRequired, domain.ReceiptDeleted)
+		if terr := h.st.TransitionReceipt(ctx, *tx.ReceiptDocumentID, domain.ReceiptReviewRequired, domain.ReceiptDeleted); terr != nil &&
+			!domain.IsCode(terr, domain.CodeConflict) {
+			return terr
+		}
 	}
 	if err := h.st.SoftDeleteTransaction(ctx, txID, user.ID); err != nil {
 		if domain.IsCode(err, domain.CodeValidation) || domain.IsCode(err, domain.CodeNotFound) {
@@ -445,12 +433,4 @@ func ptrKey(id *uuid.UUID) string {
 		return ""
 	}
 	return id.String()
-}
-
-// must logs unexpected errors without aborting the chat flow — the user
-// already got an answer or the error is recorded for the operator.
-func (h *Handler) must(err error) {
-	if err != nil {
-		h.log.Error("bot flow step failed", slog.Any("error", err))
-	}
 }

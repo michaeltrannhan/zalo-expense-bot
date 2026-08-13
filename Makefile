@@ -11,11 +11,12 @@ POSTGRES_PORT ?= 5432
 # start without first creating a secrets file. A real .env still overrides
 # every value, and config.Load keeps pilot/production fail-closed.
 APP_ENV ?= development
-DATABASE_URL ?= postgres://postgres:postgres@localhost:$(POSTGRES_PORT)/zl_expense?sslmode=disable
+POSTGRES_PASSWORD ?= postgres
+DATABASE_URL ?= postgres://postgres:$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/zl_expense?sslmode=disable
 ZALO_WEBHOOK_SECRET ?= dev-secret-change-me
 PLAYGROUND_ADDR ?= 127.0.0.1:8090
-PLAYGROUND_DATABASE_URL ?= postgres://postgres:postgres@localhost:$(POSTGRES_PORT)/zl_expense_playground?sslmode=disable
-override E2E_DATABASE_URL := postgres://postgres:postgres@localhost:$(POSTGRES_PORT)/zl_expense_e2e?sslmode=disable
+PLAYGROUND_DATABASE_URL ?= postgres://postgres:$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/zl_expense_playground?sslmode=disable
+override E2E_DATABASE_URL := postgres://postgres:$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/zl_expense_e2e?sslmode=disable
 E2E_TIMEOUT ?= 10m
 export
 
@@ -49,13 +50,15 @@ dev: migrate ## Run the API locally
 test: ## Unit tests
 	go test ./...
 
-test-integration: up ## Tests that need a real PostgreSQL
+test-integration: up ## Tests that need a real PostgreSQL (isolated zl_expense_test DB)
 	@until docker compose exec -T postgres pg_isready -U postgres -d zl_expense >/dev/null 2>&1; do sleep 0.5; done
-	TEST_DATABASE_URL="postgres://postgres:postgres@localhost:$(POSTGRES_PORT)/zl_expense?sslmode=disable" go test -p 1 -count=1 -tags integration ./...
+	@sh scripts/ensure-test-db.sh
+	TEST_DATABASE_URL="postgres://postgres:$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/zl_expense_test?sslmode=disable" go test -p 1 -count=1 -tags integration ./...
 
-race: up ## Race-enabled integration run
+race: up ## Race-enabled integration run (isolated zl_expense_test DB)
 	@until docker compose exec -T postgres pg_isready -U postgres -d zl_expense >/dev/null 2>&1; do sleep 0.5; done
-	TEST_DATABASE_URL="postgres://postgres:postgres@localhost:$(POSTGRES_PORT)/zl_expense?sslmode=disable" go test -p 1 -race -count=1 -tags integration ./...
+	@sh scripts/ensure-test-db.sh
+	TEST_DATABASE_URL="postgres://postgres:$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/zl_expense_test?sslmode=disable" go test -p 1 -race -count=1 -tags integration ./...
 
 vet:
 	go vet ./...

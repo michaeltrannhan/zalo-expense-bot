@@ -64,7 +64,7 @@ func TestExtractMapsAnswerDeterministically(t *testing.T) {
 	if err := json.Unmarshal(reqBody(), &sent); err != nil {
 		t.Fatalf("decode sent request: %v", err)
 	}
-	if sent.GenerationConfig.ResponseMimeType != "application/json" || sent.GenerationConfig.Temperature != 0 {
+	if sent.GenerationConfig.ResponseMimeType != "application/json" {
 		t.Errorf("generation config = %+v", sent.GenerationConfig)
 	}
 	if sent.Contents[0].Parts[0].Text == "" {
@@ -99,6 +99,43 @@ func TestExtractMapsAnswerDeterministically(t *testing.T) {
 	}
 	if len(res.LineItems) != 1 || res.LineItems[0].AmountMinor != 62000 {
 		t.Errorf("line items = %+v", res.LineItems)
+	}
+}
+
+func TestExtractCurrencyMismatchLowersConfidence(t *testing.T) {
+	answer := `{
+	  "is_receipt": true,
+	  "merchant": "Cafe",
+	  "total": "325.000 ₫",
+	  "currency": "USD",
+	  "date": "15/07/2026",
+	  "type_hint": null,
+	  "line_items": [],
+	  "confidence": {"merchant": 0.9, "total": 0.9, "currency": 0.9, "date": 0.9}
+	}`
+	ex, _ := fakeGemini(t, http.StatusOK, answer)
+	res, err := ex.Extract(context.Background(), strings.NewReader("img"), extraction.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Fields["currency"].Normalised != "VND" {
+		t.Fatalf("currency = %v, want VND from printed amount", res.Fields["currency"].Normalised)
+	}
+	if res.Fields["total_minor"].Normalised != int64(325000) {
+		t.Fatalf("total = %v, want 325000 VND minor", res.Fields["total_minor"].Normalised)
+	}
+	if res.Fields["currency"].Confidence > 0.4 || res.Fields["total_minor"].Confidence > 0.4 {
+		t.Fatalf("mismatch confidences = total %v currency %v, want <= 0.4",
+			res.Fields["total_minor"].Confidence, res.Fields["currency"].Confidence)
+	}
+	found := false
+	for _, w := range res.Warnings {
+		if strings.Contains(w, "currency mismatch") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %v, want currency mismatch", res.Warnings)
 	}
 }
 

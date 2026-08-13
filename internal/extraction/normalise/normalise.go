@@ -133,7 +133,13 @@ func ParseAmount(raw string, currencyHint string) (minor int64, currency string,
 		// exact only when the scaled value divides evenly (1.2tr → 1.200.000).
 		scale := int64(1)
 		for range n {
+			if scale > math.MaxInt64/10 {
+				return 0, "", domain.Ef(domain.CodeValidation, nil, "amount %q too large", raw)
+			}
 			scale *= 10
+		}
+		if factor > 1 && combined > math.MaxInt64/factor {
+			return 0, "", domain.Ef(domain.CodeValidation, nil, "amount %q too large", raw)
 		}
 		value := combined * factor
 		if value%scale != 0 {
@@ -150,6 +156,9 @@ func ParseAmount(raw string, currencyHint string) (minor int64, currency string,
 	}
 	minor = combined
 	for i := n; i < places; i++ {
+		if minor > math.MaxInt64/10 {
+			return 0, "", domain.Ef(domain.CodeValidation, nil, "amount %q too large", raw)
+		}
 		minor *= 10
 	}
 	if factor > 1 && minor > math.MaxInt64/factor {
@@ -171,8 +180,17 @@ func finishAmount(digits string, currency string, factor int64, raw string) (int
 	if err != nil {
 		return 0, "", domain.Ef(domain.CodeValidation, err, "amount %q too large", raw)
 	}
+	if v < 0 {
+		return 0, "", domain.Ef(domain.CodeValidation, nil, "amount %q too large", raw)
+	}
 	if domain.CurrencyDecimalPlaces(currency) == 2 {
+		if v > math.MaxInt64/100 {
+			return 0, "", domain.Ef(domain.CodeValidation, nil, "amount %q too large", raw)
+		}
 		v *= 100
+	}
+	if factor > 1 && v > math.MaxInt64/factor {
+		return 0, "", domain.Ef(domain.CodeValidation, nil, "amount %q too large", raw)
 	}
 	return v * factor, currency, nil
 }

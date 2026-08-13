@@ -74,6 +74,16 @@ func (s *Sweeper) Handle(ctx context.Context, job *domain.QueueJob) error {
 				continue
 			}
 		}
+		// Already discarded/deleted: only clear the leftover storage key.
+		if r.DeletedAt != nil || r.Status == domain.ReceiptDeleted {
+			if err := s.st.ClearReceiptStorageKey(ctx, r.ID); err != nil {
+				s.log.Warn("retention: clear storage key failed",
+					slog.String("receipt_id", r.ID.String()), slog.String("error", err.Error()))
+				continue
+			}
+			deleted++
+			continue
+		}
 		if err := s.st.TransitionReceipt(ctx, r.ID, r.Status, domain.ReceiptDeleted); err != nil {
 			// Conflict means the receipt moved on meanwhile (user action);
 			// nothing to undo — the object delete is retry-safe.
@@ -81,6 +91,11 @@ func (s *Sweeper) Handle(ctx context.Context, job *domain.QueueJob) error {
 				slog.String("receipt_id", r.ID.String()),
 				slog.String("from", string(r.Status)),
 				slog.String("error", err.Error()))
+			continue
+		}
+		if err := s.st.ClearReceiptStorageKey(ctx, r.ID); err != nil {
+			s.log.Warn("retention: clear storage key failed",
+				slog.String("receipt_id", r.ID.String()), slog.String("error", err.Error()))
 			continue
 		}
 		deleted++

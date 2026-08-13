@@ -45,10 +45,22 @@ func Yesterday(now time.Time, loc *time.Location) Period {
 	return Period{Start: start.UTC(), End: end.UTC()}
 }
 
+// clipCurrentEnd caps an open-ended current period at local midnight tomorrow
+// so future days in the week/month are not treated as no-spend days.
+func clipCurrentEnd(fullEnd, now time.Time, loc *time.Location) time.Time {
+	tomorrow := localMidnight(now, loc).AddDate(0, 0, 1).UTC()
+	if fullEnd.After(tomorrow) {
+		return tomorrow
+	}
+	return fullEnd
+}
+
 // ThisWeek returns the current week in loc; weeks start on Monday.
+// End is clipped to the start of tomorrow so future weekdays are excluded.
 func ThisWeek(now time.Time, loc *time.Location) Period {
 	start := weekStartLocal(now, loc)
-	return Period{Start: start.UTC(), End: start.AddDate(0, 0, 7).UTC()}
+	end := clipCurrentEnd(start.AddDate(0, 0, 7).UTC(), now, loc)
+	return Period{Start: start.UTC(), End: end}
 }
 
 // LastWeek returns the full week (Monday start) before ThisWeek.
@@ -58,9 +70,11 @@ func LastWeek(now time.Time, loc *time.Location) Period {
 }
 
 // ThisMonth returns the current calendar month in loc.
+// End is clipped to the start of tomorrow so future month days are excluded.
 func ThisMonth(now time.Time, loc *time.Location) Period {
 	start := monthStartLocal(now, loc)
-	return Period{Start: start.UTC(), End: start.AddDate(0, 1, 0).UTC()}
+	end := clipCurrentEnd(start.AddDate(0, 1, 0).UTC(), now, loc)
+	return Period{Start: start.UTC(), End: end}
 }
 
 // LastMonth returns the full calendar month before ThisMonth.

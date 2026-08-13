@@ -373,10 +373,10 @@ func (h *harness) drainKind(kind domain.JobKind, handle func(context.Context, *d
 		}
 		n++
 		if err := handle(h.ctx, job); err != nil {
-			_ = h.q.Nack(h.ctx, job.ID, err)
+			_ = h.q.Nack(h.ctx, job.ID, job.ClaimToken, err)
 			return n, fmt.Errorf("%s job: %w", kind, err)
 		}
-		if err := h.q.Ack(h.ctx, job.ID); err != nil {
+		if err := h.q.Ack(h.ctx, job.ID, job.ClaimToken); err != nil {
 			return n, fmt.Errorf("ack %s job: %w", kind, err)
 		}
 	}

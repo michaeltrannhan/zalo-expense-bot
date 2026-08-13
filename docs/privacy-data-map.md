@@ -38,7 +38,7 @@ command ("chính sách").
 ## Flows
 
 - **Consent**: pending users can only consent or read the privacy text;
-  nothing else is processed or stored beyond the identity row.
+  non-consent messages store only a sanitized idempotency envelope (no text/media).
 - **Export** (`/xuatdulieu`): CSV of all non-deleted transactions + JSON
   metadata (user, consent, identities, summary preferences, counts).
 - **Deletion** (`/xoadulieu`): full account deletion report; individual

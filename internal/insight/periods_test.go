@@ -59,19 +59,20 @@ func TestPeriods(t *testing.T) {
 		{"today dst fall back", Today, utc("2026-04-05T03:00:00Z"), sydney,
 			"2026-04-04T13:00:00Z", "2026-04-05T14:00:00Z"},
 
-		// ThisWeek: weeks start Monday.
+		// ThisWeek: weeks start Monday. End is clipped to local midnight
+		// tomorrow so future weekdays are not counted as no-spend.
 		{"thisweek sunday", ThisWeek, utc("2026-07-19T03:00:00Z"), hcm,
 			"2026-07-12T17:00:00Z", "2026-07-19T17:00:00Z"},
 		{"thisweek monday at local midnight", ThisWeek, utc("2026-07-12T17:00:00Z"), hcm,
-			"2026-07-12T17:00:00Z", "2026-07-19T17:00:00Z"},
+			"2026-07-12T17:00:00Z", "2026-07-13T17:00:00Z"},
 		{"thisweek monday one second before", ThisWeek, utc("2026-07-12T16:59:59Z"), hcm,
 			"2026-07-05T17:00:00Z", "2026-07-12T17:00:00Z"},
 		{"thisweek wednesday", ThisWeek, utc("2026-07-15T10:00:00Z"), hcm,
-			"2026-07-12T17:00:00Z", "2026-07-19T17:00:00Z"},
+			"2026-07-12T17:00:00Z", "2026-07-15T17:00:00Z"},
 		{"thisweek across year", ThisWeek, utc("2026-01-01T05:00:00Z"), hcm,
-			"2025-12-28T17:00:00Z", "2026-01-04T17:00:00Z"},
+			"2025-12-28T17:00:00Z", "2026-01-01T17:00:00Z"},
 		{"thisweek across month", ThisWeek, utc("2026-06-01T02:00:00Z"), hcm,
-			"2026-05-31T17:00:00Z", "2026-06-07T17:00:00Z"},
+			"2026-05-31T17:00:00Z", "2026-06-01T17:00:00Z"},
 
 		// LastWeek.
 		{"lastweek sunday", LastWeek, utc("2026-07-19T03:00:00Z"), hcm,
@@ -81,17 +82,17 @@ func TestPeriods(t *testing.T) {
 		{"lastweek spans leap day", LastWeek, utc("2024-03-04T01:00:00Z"), hcm,
 			"2024-02-25T17:00:00Z", "2024-03-03T17:00:00Z"},
 
-		// ThisMonth.
+		// ThisMonth: End clipped to local midnight tomorrow.
 		{"thismonth mid january", ThisMonth, utc("2026-01-15T05:00:00Z"), hcm,
-			"2025-12-31T17:00:00Z", "2026-01-31T17:00:00Z"},
+			"2025-12-31T17:00:00Z", "2026-01-15T17:00:00Z"},
 		{"thismonth first instant of month", ThisMonth, utc("2026-07-31T17:00:00Z"), hcm,
-			"2026-07-31T17:00:00Z", "2026-08-31T17:00:00Z"},
+			"2026-07-31T17:00:00Z", "2026-08-01T17:00:00Z"},
 		{"thismonth last instant of month", ThisMonth, utc("2026-08-31T16:59:59Z"), hcm,
 			"2026-07-31T17:00:00Z", "2026-08-31T17:00:00Z"},
 		{"thismonth february non-leap", ThisMonth, utc("2026-02-10T05:00:00Z"), hcm,
-			"2026-01-31T17:00:00Z", "2026-02-28T17:00:00Z"},
+			"2026-01-31T17:00:00Z", "2026-02-10T17:00:00Z"},
 		{"thismonth february leap", ThisMonth, utc("2024-02-10T05:00:00Z"), hcm,
-			"2024-01-31T17:00:00Z", "2024-02-29T17:00:00Z"},
+			"2024-01-31T17:00:00Z", "2024-02-10T17:00:00Z"},
 
 		// LastMonth.
 		{"lastmonth from january crosses year", LastMonth, utc("2026-01-15T05:00:00Z"), hcm,
@@ -125,7 +126,8 @@ func TestPeriods(t *testing.T) {
 
 // Adjacent periods must tile the timeline with no gaps and no overlaps:
 // every End equals the successor's Start (half-open, no midnight double
-// counting).
+// counting). Current ThisWeek/ThisMonth ends are clipped to tomorrow, so
+// they do not extend to the next calendar week/month edge.
 func TestPeriodsAreHalfOpen(t *testing.T) {
 	now := utc("2026-07-19T03:00:00Z")
 
@@ -138,15 +140,16 @@ func TestPeriodsAreHalfOpen(t *testing.T) {
 	if !lastW.End.Equal(thisW.Start) {
 		t.Errorf("LastWeek end %s != ThisWeek start %s", lastW.End, thisW.Start)
 	}
-	if next := ThisWeek(thisW.End, hcm); !next.Start.Equal(thisW.End) {
-		t.Errorf("ThisWeek end %s != next week start %s", thisW.End, next.Start)
+	tomorrow := localMidnight(now, hcm).AddDate(0, 0, 1).UTC()
+	if !thisW.End.Equal(tomorrow) {
+		t.Errorf("ThisWeek end %s != local midnight tomorrow %s", thisW.End, tomorrow)
 	}
 
 	thisM, lastM := ThisMonth(now, hcm), LastMonth(now, hcm)
 	if !lastM.End.Equal(thisM.Start) {
 		t.Errorf("LastMonth end %s != ThisMonth start %s", lastM.End, thisM.Start)
 	}
-	if next := ThisMonth(thisM.End, hcm); !next.Start.Equal(thisM.End) {
-		t.Errorf("ThisMonth end %s != next month start %s", thisM.End, next.Start)
+	if !thisM.End.Equal(tomorrow) {
+		t.Errorf("ThisMonth end %s != local midnight tomorrow %s", thisM.End, tomorrow)
 	}
 }

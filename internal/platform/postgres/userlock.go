@@ -33,16 +33,22 @@ func WithUserLock(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID, fn 
 	if err != nil {
 		return err
 	}
-	defer conn.Release()
 
 	key1, key2 := userLockKeys(userID)
 	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1, $2)`, key1, key2); err != nil {
+		conn.Release()
 		return err
 	}
 	defer func() {
 		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _ = conn.Exec(unlockCtx, `SELECT pg_advisory_unlock($1, $2)`, key1, key2)
+		var unlocked bool
+		err := conn.QueryRow(unlockCtx, `SELECT pg_advisory_unlock($1, $2)`, key1, key2).Scan(&unlocked)
+		if err != nil || !unlocked {
+			_ = conn.Hijack() // destroy; do not Release
+			return
+		}
+		conn.Release()
 	}()
 
 	lockedCtx := context.WithValue(ctx, userLockContextKey{}, userID)

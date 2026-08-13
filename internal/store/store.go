@@ -7,11 +7,15 @@ package store
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zl-expese-bot/internal/domain"
@@ -32,7 +36,74 @@ func (s *Store) WithUserLock(ctx context.Context, userID uuid.UUID, fn func(cont
 }
 
 func internalErr(op string, err error) error {
-	return domain.E(domain.CodeInternal, "store."+op, err)
+	return classifyStoreErr(op, err)
+}
+
+// classifyStoreErr maps connectivity, timeout, and serialization failures to
+// CodeTransient so callers can retry; everything else stays CodeInternal.
+func classifyStoreErr(op string, err error) error {
+	if err == nil {
+		return nil
+	}
+	code := domain.CodeInternal
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		code = domain.CodeTransient
+	case errors.Is(err, context.Canceled):
+		// Caller canceled the request; not a retryable store failure.
+		code = domain.CodeInternal
+	case isTransientPgError(err),
+		isTransientNetError(err),
+		errors.Is(err, io.ErrUnexpectedEOF),
+		isTransientStoreMessage(err):
+		code = domain.CodeTransient
+	}
+	return domain.E(code, "store."+op, err)
+}
+
+func isTransientPgError(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	switch pgErr.Code {
+	case "40001", // serialization_failure
+		"40P01", // deadlock_detected
+		"55P03", // lock_not_available
+		"57P01", // admin_shutdown
+		"57P02", // crash_shutdown
+		"57P03", // cannot_connect_now
+		"53300", // too_many_connections
+		"08000", // connection_exception
+		"08003", // connection_does_not_exist
+		"08006": // connection_failure
+		return true
+	default:
+		return false
+	}
+}
+
+func isTransientNetError(err error) bool {
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		return true
+	}
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
+func isTransientStoreMessage(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, frag := range []string{
+		"connection refused",
+		"i/o timeout",
+		"broken pipe",
+		"conn closed",
+	} {
+		if strings.Contains(msg, frag) {
+			return true
+		}
+	}
+	return false
 }
 
 func notFound(op, what string) error {
@@ -136,9 +207,41 @@ func (s *Store) CreateIdentity(ctx context.Context, userID uuid.UUID, provider d
 		Scan(&ident.ID, &ident.UserID, &ident.Provider, &ident.ProviderSubject, &ident.ProviderScope,
 			&ident.CreatedAt, &ident.LastSeenAt)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, domain.E(domain.CodeConflict, "store.CreateIdentity: identity exists", nil)
+		}
 		return nil, internalErr("CreateIdentity", err)
 	}
 	return &ident, nil
+}
+
+// CreateUserWithIdentity inserts a pending user and its provider identity in
+// one transaction. A unique conflict on the identity rolls back the user row
+// so concurrent first contact cannot leave orphans.
+func (s *Store) CreateUserWithIdentity(ctx context.Context, userID uuid.UUID, provider domain.Provider, subject, scope string) (*domain.User, error) {
+	err := postgres.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO users (id) VALUES ($1)`, userID); err != nil {
+			return internalErr("CreateUserWithIdentity", err)
+		}
+		id := uuid.New()
+		_, err := tx.Exec(ctx,
+			`INSERT INTO user_identities (id, user_id, provider, provider_subject, provider_scope)
+			 VALUES ($1, $2, $3, $4, $5)`,
+			id, userID, string(provider), subject, scope)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.E(domain.CodeConflict, "store.CreateUserWithIdentity: identity exists", nil)
+			}
+			return internalErr("CreateUserWithIdentity", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.GetUser(ctx, userID)
 }
 
 // TouchIdentityLastSeen refreshes last_seen_at on every verified webhook.
@@ -192,6 +295,14 @@ func (s *Store) SetUserStatus(ctx context.Context, userID uuid.UUID, status doma
 // Provider messages (webhook idempotency anchor)
 // ---------------------------------------------------------------------------
 
+// ClaimProviderMessageOpts controls optional claim behaviour.
+type ClaimProviderMessageOpts struct {
+	// Redact, when true, inserts the supplied payload then overwrites
+	// raw_payload_json with a sanitized envelope before commit, so a crash
+	// cannot leave text/media durable.
+	Redact bool
+}
+
 // ClaimProviderMessage records and leases an inbound webhook for processing.
 // Completed duplicates return claimed=false. Failed messages are reclaimed
 // immediately; a received message is reclaimed only after claimLease, which
@@ -199,6 +310,10 @@ func (s *Store) SetUserStatus(ctx context.Context, userID uuid.UUID, status doma
 // On any existing row pm.ID is replaced with the durable original ID so all
 // downstream idempotency keys remain stable across provider retries.
 func (s *Store) ClaimProviderMessage(ctx context.Context, pm *domain.ProviderMessage, claimLease time.Duration) (claimed bool, err error) {
+	return s.ClaimProviderMessageOpts(ctx, pm, claimLease, ClaimProviderMessageOpts{})
+}
+
+func (s *Store) ClaimProviderMessageOpts(ctx context.Context, pm *domain.ProviderMessage, claimLease time.Duration, opts ClaimProviderMessageOpts) (claimed bool, err error) {
 	if claimLease <= 0 {
 		return false, domain.E(domain.CodeValidation, "store.ClaimProviderMessage: claim lease must be positive", nil)
 	}
@@ -229,6 +344,14 @@ func (s *Store) ClaimProviderMessage(ctx context.Context, pm *domain.ProviderMes
 			pm.EventType, pm.PayloadHash, pm.RawPayload, pm.ReceivedAt.UTC(), now, string(status))
 		if err != nil {
 			return false, internalErr("ClaimProviderMessage", err)
+		}
+		if opts.Redact {
+			if _, err := tx.Exec(ctx,
+				`UPDATE provider_messages SET raw_payload_json = '{"redacted":true}'::jsonb WHERE id = $1`,
+				pm.ID); err != nil {
+				return false, internalErr("ClaimProviderMessage", err)
+			}
+			pm.RawPayload = []byte(`{"redacted":true}`)
 		}
 		if err := tx.Commit(ctx); err != nil {
 			return false, internalErr("ClaimProviderMessage", err)
@@ -267,10 +390,14 @@ func (s *Store) ClaimProviderMessage(ctx context.Context, pm *domain.ProviderMes
 
 	if _, err := tx.Exec(ctx,
 		`UPDATE provider_messages
-		 SET status = 'received', processing_started_at = $2, processed_at = NULL
+		 SET status = 'received', processing_started_at = $2, processed_at = NULL,
+		     raw_payload_json = CASE WHEN $3 THEN '{"redacted":true}'::jsonb ELSE raw_payload_json END
 		 WHERE id = $1`,
-		existing.ID, now); err != nil {
+		existing.ID, now, opts.Redact); err != nil {
 		return false, internalErr("ClaimProviderMessage", err)
+	}
+	if opts.Redact {
+		pm.RawPayload = []byte(`{"redacted":true}`)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, internalErr("ClaimProviderMessage", err)
@@ -293,6 +420,21 @@ func (s *Store) SetProviderMessageUser(ctx context.Context, id, userID uuid.UUID
 	}
 	if tag.RowsAffected() == 0 {
 		return domain.E(domain.CodeConflict, "store.SetProviderMessageUser: message belongs to another user", nil)
+	}
+	return nil
+}
+
+// RedactProviderMessageRaw strips text/media from a claimed inbound payload
+// while keeping the idempotency key and original payload_hash.
+func (s *Store) RedactProviderMessageRaw(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE provider_messages SET raw_payload_json = '{"redacted":true}'::jsonb WHERE id = $1`,
+		id)
+	if err != nil {
+		return internalErr("RedactProviderMessageRaw", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return notFound("RedactProviderMessageRaw", "provider message")
 	}
 	return nil
 }
@@ -479,12 +621,14 @@ func (s *Store) FindReceiptByHash(ctx context.Context, userID uuid.UUID, sha256 
 }
 
 // ListReceiptsPendingDeletion feeds the retention sweep: past delete_after
-// and not yet deleted.
+// and not yet deleted, plus soft-deleted receipts that still hold a storage
+// object key (discarded originals left behind).
 func (s *Store) ListReceiptsPendingDeletion(ctx context.Context, now time.Time) ([]domain.ReceiptDocument, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT `+receiptColumns+` FROM receipt_documents
-		 WHERE delete_after IS NOT NULL AND delete_after < $1 AND deleted_at IS NULL
-		 ORDER BY delete_after`,
+		 WHERE (delete_after IS NOT NULL AND delete_after < $1 AND deleted_at IS NULL)
+		    OR (deleted_at IS NOT NULL AND storage_key <> '')
+		 ORDER BY delete_after NULLS LAST`,
 		now.UTC())
 	if err != nil {
 		return nil, internalErr("ListReceiptsPendingDeletion", err)
@@ -502,6 +646,22 @@ func (s *Store) ListReceiptsPendingDeletion(ctx context.Context, now time.Time) 
 		return nil, internalErr("ListReceiptsPendingDeletion", err)
 	}
 	return out, nil
+}
+
+// ClearReceiptStorageKey empties storage_key after the object has been removed
+// (or was already absent), so the sweeper stops selecting the row.
+func (s *Store) ClearReceiptStorageKey(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE receipt_documents SET storage_key = '', updated_at = now()
+		 WHERE id = $1`,
+		id)
+	if err != nil {
+		return internalErr("ClearReceiptStorageKey", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return notFound("ClearReceiptStorageKey", "receipt")
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +714,8 @@ func scanTransaction(row pgx.Row) (*domain.Transaction, error) {
 }
 
 // CreateTransaction inserts a transaction row; the caller owns the ID,
-// status and initial version (1).
+// status and initial version (1). Duplicate active receipt drafts map to
+// CodeConflict via idx_tx_receipt_active.
 func (s *Store) CreateTransaction(ctx context.Context, t *domain.Transaction) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO transactions
@@ -566,9 +727,320 @@ func (s *Store) CreateTransaction(ctx context.Context, t *domain.Transaction) er
 		t.MerchantName, t.Description, t.AmountMinor, t.Currency, t.OccurredAt.UTC(), t.CategoryID,
 		string(t.Status), string(t.Source), t.ConfidenceSummary, t.ConfirmedAt, t.Version)
 	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return domain.E(domain.CodeConflict, "store.CreateTransaction: duplicate", nil)
+		}
 		return internalErr("CreateTransaction", err)
 	}
 	return nil
+}
+
+// GetActiveTransactionByReceipt returns the non-deleted transaction linked to
+// a receipt, if any. Used for crash-safe draft resume.
+func (s *Store) GetActiveTransactionByReceipt(ctx context.Context, receiptID uuid.UUID) (*domain.Transaction, error) {
+	t, err := scanTransaction(s.pool.QueryRow(ctx,
+		`SELECT `+txColumns+` FROM transactions
+		 WHERE receipt_document_id = $1 AND deleted_at IS NULL AND status <> 'deleted'
+		 ORDER BY created_at DESC LIMIT 1`,
+		receiptID))
+	if isNoRows(err) {
+		return nil, notFound("GetActiveTransactionByReceipt", "transaction")
+	}
+	if err != nil {
+		return nil, internalErr("GetActiveTransactionByReceipt", err)
+	}
+	return t, nil
+}
+
+// ReceiptReviewDraft is the atomic unit-of-work that turns extraction output
+// into a reviewable draft: transaction, provenance, predictions, receipt
+// status, and pending action commit together or not at all.
+type ReceiptReviewDraft struct {
+	FromStatus  domain.ReceiptStatus
+	Transaction *domain.Transaction
+	Fields      []domain.ExtractedField
+	Predictions []domain.Prediction
+	Pending     *domain.PendingAction
+}
+
+// FinalizeReceiptReview persists a receipt draft transactionally. If an
+// active transaction already exists for the receipt, that row is reused
+// (idempotent resume) and fields/predictions are refreshed.
+func (s *Store) FinalizeReceiptReview(ctx context.Context, d ReceiptReviewDraft) error {
+	if d.Transaction == nil || d.Pending == nil {
+		return domain.E(domain.CodeValidation, "store.FinalizeReceiptReview: missing draft fields", nil)
+	}
+	if d.Transaction.ReceiptDocumentID == nil {
+		return domain.E(domain.CodeValidation, "store.FinalizeReceiptReview: receipt id required", nil)
+	}
+	receiptID := *d.Transaction.ReceiptDocumentID
+	return postgres.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		existing, err := scanTransaction(tx.QueryRow(ctx,
+			`SELECT `+txColumns+` FROM transactions
+			 WHERE receipt_document_id = $1 AND deleted_at IS NULL AND status <> 'deleted'
+			 ORDER BY created_at DESC LIMIT 1
+			 FOR UPDATE`,
+			receiptID))
+		switch {
+		case isNoRows(err):
+			if d.Transaction.ID == uuid.Nil {
+				d.Transaction.ID = uuid.New()
+			}
+			_, err = tx.Exec(ctx,
+				`INSERT INTO transactions
+					(id, user_id, receipt_document_id, account_id, type, merchant_id,
+					 merchant_name, description, amount_minor, currency, occurred_at, category_id,
+					 status, source, confidence_summary, confirmed_at, version)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+				d.Transaction.ID, d.Transaction.UserID, d.Transaction.ReceiptDocumentID, d.Transaction.AccountID,
+				string(d.Transaction.Type), d.Transaction.MerchantID, d.Transaction.MerchantName,
+				d.Transaction.Description, d.Transaction.AmountMinor, d.Transaction.Currency,
+				d.Transaction.OccurredAt.UTC(), d.Transaction.CategoryID, string(d.Transaction.Status),
+				string(d.Transaction.Source), d.Transaction.ConfidenceSummary, d.Transaction.ConfirmedAt,
+				d.Transaction.Version)
+			if err != nil {
+				var pgErr *pgconn.PgError
+				if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+					return domain.E(domain.CodeConflict, "store.FinalizeReceiptReview: duplicate draft", nil)
+				}
+				return internalErr("FinalizeReceiptReview.insertTx", err)
+			}
+		case err != nil:
+			return internalErr("FinalizeReceiptReview.loadTx", err)
+		default:
+			d.Transaction.ID = existing.ID
+			d.Transaction.Version = existing.Version
+			_, err = tx.Exec(ctx,
+				`UPDATE transactions SET
+					type = $2, merchant_id = $3, merchant_name = $4, description = $5,
+					amount_minor = $6, currency = $7, occurred_at = $8, category_id = $9,
+					status = $10, confidence_summary = $11, version = version + 1, updated_at = now()
+				 WHERE id = $1 AND deleted_at IS NULL`,
+				existing.ID, string(d.Transaction.Type), d.Transaction.MerchantID, d.Transaction.MerchantName,
+				d.Transaction.Description, d.Transaction.AmountMinor, d.Transaction.Currency,
+				d.Transaction.OccurredAt.UTC(), d.Transaction.CategoryID, string(d.Transaction.Status),
+				d.Transaction.ConfidenceSummary)
+			if err != nil {
+				return internalErr("FinalizeReceiptReview.updateTx", err)
+			}
+			d.Transaction.Version = existing.Version + 1
+			if _, err := tx.Exec(ctx, `DELETE FROM predictions WHERE transaction_id = $1`, existing.ID); err != nil {
+				return internalErr("FinalizeReceiptReview.clearPreds", err)
+			}
+		}
+
+		if _, err := tx.Exec(ctx, `DELETE FROM extracted_fields WHERE receipt_document_id = $1`, receiptID); err != nil {
+			return internalErr("FinalizeReceiptReview.clearFields", err)
+		}
+		for i := range d.Fields {
+			f := &d.Fields[i]
+			if f.ID == uuid.Nil {
+				f.ID = uuid.New()
+			}
+			evidence := f.Evidence
+			if len(evidence) == 0 {
+				evidence = []byte("{}")
+			}
+			source := f.Source
+			if source == "" {
+				source = "extractor"
+			}
+			_, err := tx.Exec(ctx,
+				`INSERT INTO extracted_fields
+					(id, receipt_document_id, field_name, raw_value, normalised_value,
+					 confidence, source, evidence_json, extractor_name, extractor_version)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+				f.ID, f.ReceiptDocumentID, f.FieldName, f.RawValue, f.NormalisedValue,
+				f.Confidence, source, evidence, f.ExtractorName, f.ExtractorVersion)
+			if err != nil {
+				return internalErr("FinalizeReceiptReview.fields", err)
+			}
+		}
+		for i := range d.Predictions {
+			p := &d.Predictions[i]
+			if p.ID == uuid.Nil {
+				p.ID = uuid.New()
+			}
+			p.TransactionID = d.Transaction.ID
+			features := p.FeatureSnapshot
+			if len(features) == 0 {
+				features = []byte("{}")
+			}
+			_, err := tx.Exec(ctx,
+				`INSERT INTO predictions
+					(id, transaction_id, prediction_type, predicted_value,
+					 confidence, model_name, model_version, feature_snapshot_json)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				p.ID, p.TransactionID, p.PredictionType, p.PredictedValue,
+				p.Confidence, p.ModelName, p.ModelVersion, features)
+			if err != nil {
+				return internalErr("FinalizeReceiptReview.preds", err)
+			}
+		}
+
+		if !d.FromStatus.CanTransition(domain.ReceiptReviewRequired) {
+			return domain.Ef(domain.CodeValidation, nil,
+				"store.FinalizeReceiptReview: illegal receipt transition %s -> review_required", d.FromStatus)
+		}
+		tag, err := tx.Exec(ctx,
+			`UPDATE receipt_documents SET status = 'review_required', updated_at = now()
+			 WHERE id = $1 AND status = $2`,
+			receiptID, string(d.FromStatus))
+		if err != nil {
+			return internalErr("FinalizeReceiptReview.receipt", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.Ef(domain.CodeConflict, nil,
+				"store.FinalizeReceiptReview: receipt not in status %s", d.FromStatus)
+		}
+
+		if d.Pending.ID == uuid.Nil {
+			d.Pending.ID = uuid.New()
+		}
+		d.Pending.TransactionID = &d.Transaction.ID
+		if _, err := tx.Exec(ctx, `DELETE FROM pending_actions WHERE user_id = $1`, d.Pending.UserID); err != nil {
+			return internalErr("FinalizeReceiptReview.clearPending", err)
+		}
+		payload := d.Pending.Payload
+		if len(payload) == 0 {
+			payload = []byte("{}")
+		}
+		_, err = tx.Exec(ctx,
+			`INSERT INTO pending_actions (id, user_id, kind, transaction_id, payload_json, expires_at)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			d.Pending.ID, d.Pending.UserID, string(d.Pending.Kind), d.Pending.TransactionID,
+			payload, d.Pending.ExpiresAt.UTC())
+		if err != nil {
+			return internalErr("FinalizeReceiptReview.pending", err)
+		}
+		return nil
+	})
+}
+
+// ManualDraftBundle atomically creates a manual transaction, predictions, and
+// pending confirmation action.
+type ManualDraftBundle struct {
+	Transaction       *domain.Transaction
+	Predictions       []domain.Prediction
+	Pending           *domain.PendingAction
+	ProviderMessageID *uuid.UUID
+}
+
+// CreateManualDraft persists a manual entry unit-of-work. When
+// ProviderMessageID is set, a retry of the same inbound message reuses the
+// existing draft instead of inserting a second transaction.
+func (s *Store) CreateManualDraft(ctx context.Context, d ManualDraftBundle) error {
+	if d.Transaction == nil || d.Pending == nil {
+		return domain.E(domain.CodeValidation, "store.CreateManualDraft: missing draft fields", nil)
+	}
+	return postgres.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if d.ProviderMessageID != nil {
+			existing, err := scanTransaction(tx.QueryRow(ctx,
+				`SELECT `+txColumns+` FROM transactions
+				 WHERE provider_message_id = $1 AND deleted_at IS NULL AND status <> 'deleted'
+				 LIMIT 1
+				 FOR UPDATE`,
+				*d.ProviderMessageID))
+			if err == nil {
+				d.Transaction.ID = existing.ID
+				d.Transaction.Version = existing.Version
+				d.Transaction.AmountMinor = existing.AmountMinor
+				d.Transaction.Currency = existing.Currency
+				d.Transaction.MerchantName = existing.MerchantName
+				d.Transaction.Type = existing.Type
+				d.Transaction.CategoryID = existing.CategoryID
+				d.Transaction.OccurredAt = existing.OccurredAt
+				d.Transaction.Status = existing.Status
+				if d.Pending.ID == uuid.Nil {
+					d.Pending.ID = uuid.New()
+				}
+				d.Pending.TransactionID = &existing.ID
+				if _, err := tx.Exec(ctx, `DELETE FROM pending_actions WHERE user_id = $1`, d.Pending.UserID); err != nil {
+					return internalErr("CreateManualDraft.clearPending", err)
+				}
+				payload := d.Pending.Payload
+				if len(payload) == 0 {
+					payload = []byte("{}")
+				}
+				_, err = tx.Exec(ctx,
+					`INSERT INTO pending_actions (id, user_id, kind, transaction_id, payload_json, expires_at)
+					 VALUES ($1, $2, $3, $4, $5, $6)`,
+					d.Pending.ID, d.Pending.UserID, string(d.Pending.Kind), d.Pending.TransactionID,
+					payload, d.Pending.ExpiresAt.UTC())
+				if err != nil {
+					return internalErr("CreateManualDraft.pending", err)
+				}
+				return nil
+			}
+			if !isNoRows(err) {
+				return internalErr("CreateManualDraft.lookup", err)
+			}
+		}
+		if d.Transaction.ID == uuid.Nil {
+			d.Transaction.ID = uuid.New()
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO transactions
+				(id, user_id, receipt_document_id, account_id, type, merchant_id,
+				 merchant_name, description, amount_minor, currency, occurred_at, category_id,
+				 status, source, confidence_summary, confirmed_at, version, provider_message_id)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+			d.Transaction.ID, d.Transaction.UserID, d.Transaction.ReceiptDocumentID, d.Transaction.AccountID,
+			string(d.Transaction.Type), d.Transaction.MerchantID, d.Transaction.MerchantName,
+			d.Transaction.Description, d.Transaction.AmountMinor, d.Transaction.Currency,
+			d.Transaction.OccurredAt.UTC(), d.Transaction.CategoryID, string(d.Transaction.Status),
+			string(d.Transaction.Source), d.Transaction.ConfidenceSummary, d.Transaction.ConfirmedAt,
+			d.Transaction.Version, d.ProviderMessageID)
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				return domain.E(domain.CodeConflict, "store.CreateManualDraft: duplicate provider message", nil)
+			}
+			return internalErr("CreateManualDraft.insertTx", err)
+		}
+		for i := range d.Predictions {
+			p := &d.Predictions[i]
+			if p.ID == uuid.Nil {
+				p.ID = uuid.New()
+			}
+			p.TransactionID = d.Transaction.ID
+			features := p.FeatureSnapshot
+			if len(features) == 0 {
+				features = []byte("{}")
+			}
+			_, err := tx.Exec(ctx,
+				`INSERT INTO predictions
+					(id, transaction_id, prediction_type, predicted_value,
+					 confidence, model_name, model_version, feature_snapshot_json)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+				p.ID, p.TransactionID, p.PredictionType, p.PredictedValue,
+				p.Confidence, p.ModelName, p.ModelVersion, features)
+			if err != nil {
+				return internalErr("CreateManualDraft.preds", err)
+			}
+		}
+		if d.Pending.ID == uuid.Nil {
+			d.Pending.ID = uuid.New()
+		}
+		d.Pending.TransactionID = &d.Transaction.ID
+		if _, err := tx.Exec(ctx, `DELETE FROM pending_actions WHERE user_id = $1`, d.Pending.UserID); err != nil {
+			return internalErr("CreateManualDraft.clearPending", err)
+		}
+		payload := d.Pending.Payload
+		if len(payload) == 0 {
+			payload = []byte("{}")
+		}
+		_, err = tx.Exec(ctx,
+			`INSERT INTO pending_actions (id, user_id, kind, transaction_id, payload_json, expires_at)
+			 VALUES ($1, $2, $3, $4, $5, $6)`,
+			d.Pending.ID, d.Pending.UserID, string(d.Pending.Kind), d.Pending.TransactionID,
+			payload, d.Pending.ExpiresAt.UTC())
+		if err != nil {
+			return internalErr("CreateManualDraft.pending", err)
+		}
+		return nil
+	})
 }
 
 // GetTransaction loads a transaction by primary key, including soft-deleted

@@ -9,7 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -76,7 +78,8 @@ func (p *Processor) Handle(ctx context.Context, job *domain.QueueJob) error {
 		if user.Status == domain.UserDeleted || user.DeletedAt != nil {
 			return nil
 		}
-		return p.handleLocked(lockedCtx, job, payload)
+		err = p.handleLocked(lockedCtx, job, payload)
+		return p.ackPolicy(lockedCtx, payload.ReceiptID, err)
 	})
 }
 
@@ -92,8 +95,8 @@ func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payl
 		return domain.E(domain.CodeValidation, "receipt job user does not own receipt", nil)
 	}
 
-	// Idempotent resume: anything at/after review_required is done; a
-	// transient failure re-enters the queue state first.
+	// Idempotent resume: terminal states are done; mid-pipeline stages
+	// continue from their checkpoint after a crash or lease reclaim.
 	switch r.Status {
 	case domain.ReceiptReviewRequired, domain.ReceiptConfirmed, domain.ReceiptDeleted,
 		domain.ReceiptFailedPermanent:
@@ -103,52 +106,46 @@ func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payl
 			return p.conflictAsDone(ctx, r.ID, err)
 		}
 		r.Status = domain.ReceiptQueued
-	case domain.ReceiptQueued:
+	case domain.ReceiptQueued, domain.ReceiptDownloading, domain.ReceiptStored, domain.ReceiptExtracting:
+		// fall through and resume
 	default:
-		return nil // received/downloading/... handled elsewhere or in flight
+		return nil // received or unknown — nothing for this job to do
 	}
 
-	attempt := job.Attempts + 1
+	// Dequeue already incremented attempts; use that as the attempt number.
+	attempt := job.Attempts
+	if attempt < 1 {
+		attempt = 1
+	}
 	if err := p.st.RecordAttempt(ctx, r.ID, p.extractor.Name(), p.extractor.Version(), attempt, "started", "", ""); err != nil {
 		p.log.Warn("record attempt start failed", slog.String("error", err.Error()))
 	}
 
-	if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptQueued, domain.ReceiptDownloading); err != nil {
-		return p.conflictAsDone(ctx, r.ID, err)
-	}
-	r.Status = domain.ReceiptDownloading
-
-	data, contentType, err := p.fetchAndValidate(ctx, r)
+	data, contentType, err := p.ensureStoredImage(ctx, r)
 	if err != nil {
+		if domain.IsCode(err, domain.CodeConflict) {
+			return p.conflictAsDone(ctx, r.ID, err)
+		}
+		if domain.IsCode(err, domain.CodeValidation) && strings.Contains(err.Error(), "duplicate receipt") {
+			return p.failWith(ctx, r, payload, attempt, "duplicate", conversation.DuplicateReceiptText())
+		}
 		return p.fail(ctx, r, payload, attempt, err, conversation.UnsupportedImageText())
 	}
-
-	// Duplicate content check before any paid work (plan §13.1).
-	if dup, derr := p.st.FindReceiptByHash(ctx, r.UserID, shaOf(data)); derr == nil && dup.ID != r.ID {
-		return p.failWith(ctx, r, payload, attempt, "duplicate", conversation.DuplicateReceiptText())
-	} else if derr != nil && !domain.IsCode(derr, domain.CodeNotFound) {
-		return p.fail(ctx, r, payload, attempt, derr, "")
+	// Reload after stage transitions inside ensureStoredImage.
+	if latest, lerr := p.st.GetReceipt(ctx, r.ID); lerr == nil {
+		r = latest
 	}
 
-	if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptDownloading, domain.ReceiptStored); err != nil {
-		return p.conflictAsDone(ctx, r.ID, err)
-	}
-	r.Status = domain.ReceiptStored
-
-	stored, err := p.objects.Put(ctx, StorageKey(r.UserID, r.ID), bytes.NewReader(data), contentType)
-	if err != nil {
-		return p.fail(ctx, r, payload, attempt, domain.E(domain.CodeTransient, "object store put", err), "")
-	}
-	if err := p.st.SetReceiptStored(ctx, r.ID, stored.Key, stored.SHA256, contentType, stored.ByteSize); err != nil {
-		// A failed bookkeeping write must not strand the receipt in
-		// 'stored'; classify it so the job retries through the queue.
-		return p.fail(ctx, r, payload, attempt, domain.E(domain.CodeTransient, "record stored receipt", err), "")
+	if r.Status == domain.ReceiptStored {
+		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptStored, domain.ReceiptExtracting); err != nil {
+			return p.conflictAsDone(ctx, r.ID, err)
+		}
+		r.Status = domain.ReceiptExtracting
 	}
 
-	if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptStored, domain.ReceiptExtracting); err != nil {
-		return p.conflictAsDone(ctx, r.ID, err)
+	if r.Status != domain.ReceiptExtracting {
+		return domain.Ef(domain.CodeInternal, nil, "receipt %s not extracting after store", r.ID)
 	}
-	r.Status = domain.ReceiptExtracting
 
 	// Kill switch and monthly OCR quota, enforced in code (plan §13.1).
 	if !p.ExtractionEnabled {
@@ -181,21 +178,12 @@ func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payl
 		return p.fail(ctx, r, payload, attempt, err, "")
 	}
 
-	tx, sug, err := p.buildDraft(ctx, r, result)
+	tx, sug, err := p.buildAndPersistDraft(ctx, r, result)
 	if err != nil {
+		if domain.IsCode(err, domain.CodeConflict) {
+			return p.conflictAsDone(ctx, r.ID, err)
+		}
 		return p.fail(ctx, r, payload, attempt, err, "")
-	}
-
-	if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptExtracting, domain.ReceiptReviewRequired); err != nil {
-		return err
-	}
-
-	expires := p.clk.Now().Add(24 * time.Hour)
-	if err := p.st.SetPendingAction(ctx, &domain.PendingAction{
-		UserID: r.UserID, Kind: domain.PendingConfirmExtraction,
-		TransactionID: &tx.ID, ExpiresAt: expires,
-	}); err != nil {
-		return err
 	}
 
 	card := p.renderCard(ctx, r.UserID, tx, result, sug)
@@ -216,6 +204,76 @@ func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payl
 		p.log.Warn("record attempt success failed", slog.String("error", err.Error()))
 	}
 	return nil
+}
+
+// ensureStoredImage resumes download/store checkpoints until the receipt has
+// a durable object and status stored (or already extracting with a key).
+func (p *Processor) ensureStoredImage(ctx context.Context, r *domain.ReceiptDocument) ([]byte, string, error) {
+	if r.Status == domain.ReceiptExtracting && r.StorageKey != "" {
+		return p.readStored(ctx, r)
+	}
+	if r.Status == domain.ReceiptStored && r.StorageKey != "" {
+		return p.readStored(ctx, r)
+	}
+
+	if r.Status == domain.ReceiptQueued {
+		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptQueued, domain.ReceiptDownloading); err != nil {
+			return nil, "", err
+		}
+		r.Status = domain.ReceiptDownloading
+	}
+
+	data, contentType, err := p.fetchAndValidate(ctx, r)
+	if err != nil {
+		return nil, "", err
+	}
+
+	// Duplicate content check before any paid work (plan §13.1).
+	if dup, derr := p.st.FindReceiptByHash(ctx, r.UserID, shaOf(data)); derr == nil && dup.ID != r.ID {
+		return nil, "", domain.E(domain.CodeValidation, "duplicate receipt image", nil)
+	} else if derr != nil && !domain.IsCode(derr, domain.CodeNotFound) {
+		return nil, "", derr
+	}
+
+	if r.Status == domain.ReceiptDownloading {
+		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptDownloading, domain.ReceiptStored); err != nil {
+			return nil, "", err
+		}
+		r.Status = domain.ReceiptStored
+	}
+
+	stored, err := p.objects.Put(ctx, StorageKey(r.UserID, r.ID), bytes.NewReader(data), contentType)
+	if err != nil {
+		return nil, "", domain.E(domain.CodeTransient, "object store put", err)
+	}
+	if err := p.st.SetReceiptStored(ctx, r.ID, stored.Key, stored.SHA256, contentType, stored.ByteSize); err != nil {
+		return nil, "", domain.E(domain.CodeTransient, "record stored receipt", err)
+	}
+	r.StorageKey = stored.Key
+	r.SHA256 = stored.SHA256
+	r.ContentType = contentType
+	r.ByteSize = stored.ByteSize
+	return data, contentType, nil
+}
+
+func (p *Processor) readStored(ctx context.Context, r *domain.ReceiptDocument) ([]byte, string, error) {
+	rc, err := p.objects.Open(ctx, r.StorageKey)
+	if err != nil {
+		return nil, "", domain.E(domain.CodeTransient, "object store open", err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(io.LimitReader(rc, p.MaxImageBytes+1))
+	if err != nil {
+		return nil, "", domain.E(domain.CodeTransient, "read stored receipt", err)
+	}
+	if int64(len(data)) > p.MaxImageBytes {
+		return nil, "", domain.Ef(domain.CodeValidation, nil, "stored receipt exceeds %d byte cap", p.MaxImageBytes)
+	}
+	ct := r.ContentType
+	if ct == "" {
+		ct = "application/octet-stream"
+	}
+	return data, ct, nil
 }
 
 // dupWindow bounds the soft-duplicate search around the transaction time.
@@ -286,9 +344,8 @@ func (p *Processor) fetchAndValidate(ctx context.Context, r *domain.ReceiptDocum
 	return data, contentType, nil
 }
 
-// buildDraft turns an extraction result into a persisted draft transaction
-// with extracted-field provenance and prediction records.
-func (p *Processor) buildDraft(ctx context.Context, r *domain.ReceiptDocument, result events.ExtractionResult) (*domain.Transaction, categorisation.Suggestion, error) {
+// buildAndPersistDraft turns extraction into a transactional review draft.
+func (p *Processor) buildAndPersistDraft(ctx context.Context, r *domain.ReceiptDocument, result events.ExtractionResult) (*domain.Transaction, categorisation.Suggestion, error) {
 	user, err := p.st.GetUser(ctx, r.UserID)
 	if err != nil {
 		return nil, categorisation.Suggestion{}, err
@@ -348,13 +405,6 @@ func (p *Processor) buildDraft(ctx context.Context, r *domain.ReceiptDocument, r
 		Version:           1,
 		CreatedAt:         now, UpdatedAt: now,
 	}
-	if err := p.st.CreateTransaction(ctx, tx); err != nil {
-		return nil, categorisation.Suggestion{}, err
-	}
-
-	if err := p.st.InsertExtractedFields(ctx, provenance(r.ID, result)); err != nil {
-		return nil, categorisation.Suggestion{}, err
-	}
 	preds := []domain.Prediction{
 		{ID: uuid.New(), TransactionID: tx.ID, PredictionType: "category",
 			PredictedValue: sug.CategoryKey, Confidence: sug.Confidence,
@@ -369,9 +419,20 @@ func (p *Processor) buildDraft(ctx context.Context, r *domain.ReceiptDocument, r
 			Confidence: fieldConf(result, "merchant"), ModelName: "merchant-resolution",
 			ModelVersion: string(matchKind), CreatedAt: now})
 	}
-	if err := p.st.InsertPredictions(ctx, preds); err != nil {
+	expires := now.Add(24 * time.Hour)
+	if err := p.st.FinalizeReceiptReview(ctx, store.ReceiptReviewDraft{
+		FromStatus:  domain.ReceiptExtracting,
+		Transaction: tx,
+		Fields:      provenance(r.ID, result),
+		Predictions: preds,
+		Pending: &domain.PendingAction{
+			UserID: r.UserID, Kind: domain.PendingConfirmExtraction,
+			TransactionID: &tx.ID, ExpiresAt: expires,
+		},
+	}); err != nil {
 		return nil, categorisation.Suggestion{}, err
 	}
+	r.Status = domain.ReceiptReviewRequired
 	return tx, sug, nil
 }
 
@@ -390,16 +451,49 @@ func (p *Processor) fail(ctx context.Context, r *domain.ReceiptDocument, payload
 	return p.failWith(ctx, r, payload, attempt, string(domain.CodeOf(cause)), msg)
 }
 
-// failWith records a permanent failure, notifies the user, and returns nil
-// so the worker Acks — nothing here can be fixed by a retry.
+// failWith records a permanent failure and notifies the user. It returns
+// nil only after the receipt is in a terminal status so the worker can ACK.
 func (p *Processor) failWith(ctx context.Context, r *domain.ReceiptDocument, payload events.ReceiptJob, attempt int, class, msg string) error {
-	_ = p.st.TransitionReceipt(ctx, r.ID, r.Status, domain.ReceiptFailedPermanent)
+	if err := p.st.TransitionReceipt(ctx, r.ID, r.Status, domain.ReceiptFailedPermanent); err != nil {
+		if !domain.IsCode(err, domain.CodeConflict) && !domain.IsCode(err, domain.CodeValidation) {
+			return domain.E(domain.CodeTransient, "persist permanent receipt failure", err)
+		}
+		latest, lerr := p.st.GetReceipt(ctx, r.ID)
+		if lerr != nil || !receiptTerminal(latest.Status) {
+			return domain.E(domain.CodeTransient, "permanent receipt failure not durable", err)
+		}
+	} else {
+		r.Status = domain.ReceiptFailedPermanent
+	}
 	_ = p.st.RecordAttempt(ctx, r.ID, p.extractor.Name(), p.extractor.Version(), attempt, "failed", "permanent", class)
 	if msg != "" {
 		if err := p.replies.Reply(ctx, r.UserID, domain.Provider(payload.Provider), payload.ProviderChatID, msg,
 			fmt.Sprintf("fail:%s:%s", r.ID, class)); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func receiptTerminal(status domain.ReceiptStatus) bool {
+	switch status {
+	case domain.ReceiptReviewRequired, domain.ReceiptConfirmed, domain.ReceiptDeleted,
+		domain.ReceiptFailedPermanent:
+		return true
+	default:
+		return false
+	}
+}
+
+// ackPolicy converts a permanent handler error into a retry when the receipt
+// is not yet in a terminal status, so the worker NACKs instead of ACKing.
+func (p *Processor) ackPolicy(ctx context.Context, receiptID uuid.UUID, err error) error {
+	if err == nil || domain.Retryable(err) {
+		return err
+	}
+	r, gerr := p.st.GetReceipt(ctx, receiptID)
+	if gerr != nil || r == nil || !receiptTerminal(r.Status) {
+		return domain.E(domain.CodeTransient, "permanent failure not yet durable", err)
 	}
 	return nil
 }
