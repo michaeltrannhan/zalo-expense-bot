@@ -58,7 +58,11 @@ func NewS3(client S3API, bucket, prefix string) (*S3, error) {
 func ConnectS3(ctx context.Context, bucket, prefix, endpoint, region string) (*S3, error) {
 	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
 	if region == "" && endpoint != "" {
-		region = "auto"
+		if strings.Contains(endpoint, "r2.cloudflarestorage.com") {
+			region = "auto"
+		} else {
+			region = "us-east-1" // MinIO and most S3 clones
+		}
 	}
 	var loadOpts []func(*awsconfig.LoadOptions) error
 	if region != "" {

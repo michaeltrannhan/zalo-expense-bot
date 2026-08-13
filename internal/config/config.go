@@ -36,6 +36,10 @@ type Config struct {
 	S3Endpoint         string
 	S3Region           string
 
+	// OriginalRetentionDays is how long receipt image bytes are kept before
+	// the hourly sweeper deletes them. Extracted transactions are retained.
+	OriginalRetentionDays int
+
 	ExtractionBackend string
 	GeminiAPIKey      string
 	GeminiModel       string
@@ -81,6 +85,10 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	retentionDays, err := envInt("ORIGINAL_RETENTION_DAYS", 1)
+	if err != nil {
+		return Config{}, err
+	}
 	receiptConcurrency, err := envInt("RECEIPT_WORKER_CONCURRENCY", 4)
 	if err != nil {
 		return Config{}, err
@@ -121,6 +129,7 @@ func Load() (Config, error) {
 		MonthlyOCRPageLimit:           ocrLimit,
 		PerUserDailyReceiptLimit:      receiptLimit,
 		ZaloMonthlyMessageLimit:       messageLimit,
+		OriginalRetentionDays:         int(retentionDays),
 		ReceiptWorkerConcurrency:      int(receiptConcurrency),
 		NotificationWorkerConcurrency: int(notificationConcurrency),
 		QueuePollInterval:             queuePoll,
@@ -158,7 +167,7 @@ func (c Config) validate() error {
 			return fmt.Errorf("S3_BUCKET is required when OBJECTSTORE=s3")
 		}
 		if c.S3Endpoint != "" {
-			if err := requireHTTPS("S3_ENDPOINT", c.S3Endpoint); err != nil {
+			if err := requireObjectStoreEndpoint("S3_ENDPOINT", c.S3Endpoint); err != nil {
 				return err
 			}
 		}
@@ -190,6 +199,9 @@ func (c Config) validate() error {
 		if value < 0 {
 			return fmt.Errorf("%s must be non-negative", name)
 		}
+	}
+	if c.OriginalRetentionDays < 1 || c.OriginalRetentionDays > 365 {
+		return fmt.Errorf("ORIGINAL_RETENTION_DAYS must be between 1 and 365")
 	}
 	for name, value := range map[string]int{
 		"RECEIPT_WORKER_CONCURRENCY":      c.ReceiptWorkerConcurrency,
@@ -230,9 +242,6 @@ func (c Config) validate() error {
 		}
 	}
 	if c.AppEnv == EnvProduction {
-		if c.ObjectStoreBackend != "s3" {
-			return fmt.Errorf("OBJECTSTORE must be s3 when APP_ENV=production")
-		}
 		if c.ExtractionBackend == "mock" {
 			return fmt.Errorf("EXTRACTOR must not be mock when APP_ENV=production")
 		}
@@ -317,6 +326,37 @@ func requireHTTPS(name, raw string) error {
 		return fmt.Errorf("%s must be an absolute https URL", name)
 	}
 	return nil
+}
+
+// requireObjectStoreEndpoint accepts HTTPS anywhere, or HTTP on loopback
+// (local MinIO). Public HTTP endpoints are rejected.
+func requireObjectStoreEndpoint(name, raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("%s must be an absolute URL", name)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+			return nil
+		}
+		return fmt.Errorf("%s http is allowed only on loopback (local MinIO)", name)
+	default:
+		return fmt.Errorf("%s must be an absolute http(s) URL", name)
+	}
+}
+
+// OriginalRetention is the image keep window and the policy label written
+// onto new receipt rows. Zero (tests that skip Load) falls back to 1 day.
+func (c Config) OriginalRetention() (keep time.Duration, policy string) {
+	days := c.OriginalRetentionDays
+	if days < 1 {
+		days = 1
+	}
+	return time.Duration(days) * 24 * time.Hour, fmt.Sprintf("originals_%dd", days)
 }
 
 func validModelID(value string) bool {

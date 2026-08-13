@@ -42,10 +42,11 @@ func (h *Handler) handleImage(ctx context.Context, user *domain.User, ev events.
 	}
 
 	receiptID := uuid.New()
-	deleteAfter := h.clk.Now().Add(30 * 24 * time.Hour)
+	keep, policy := h.cfg.OriginalRetention()
+	deleteAfter := h.clk.Now().Add(keep)
 	receipt, created, err := h.st.GetOrCreateReceiptForProviderMessage(ctx, &domain.ReceiptDocument{
 		ID: receiptID, UserID: user.ID, ProviderMessageID: &pm.ID,
-		RetentionPolicy: "originals_30d", DeleteAfter: &deleteAfter,
+		RetentionPolicy: policy, DeleteAfter: &deleteAfter,
 	})
 	if err != nil {
 		return err

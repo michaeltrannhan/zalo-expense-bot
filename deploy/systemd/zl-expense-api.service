@@ -1,0 +1,19 @@
+[Unit]
+Description=zl-expense API (Zalo long-poll or webhook)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+WorkingDirectory=@ROOT@
+EnvironmentFile=@ROOT@/.env
+# Drop "-poll" after Caddy terminates HTTPS at /webhook/zalo.
+ExecStart=@ROOT@/bin/api -poll
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

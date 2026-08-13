@@ -4,6 +4,8 @@ BIN := bin
 # Host port for the local PostgreSQL container; .env may override it when
 # 5432 is taken by another service (see docker-compose.yml).
 POSTGRES_PORT ?= 5432
+MINIO_API_PORT ?= 9000
+MINIO_CONSOLE_PORT ?= 9001
 
 -include .env
 
@@ -20,12 +22,12 @@ override E2E_DATABASE_URL := postgres://postgres:$(POSTGRES_PASSWORD)@localhost:
 E2E_TIMEOUT ?= 10m
 export
 
-.PHONY: all build dev up down migrate test test-integration race lint vet fmt simulate playground provider-check e2e-real run-local clean
+.PHONY: all build dev up down migrate test test-integration race lint vet fmt simulate playground provider-check e2e-real run-local vm-rebuild clean
 
 all: build
 
-up: ## Start PostgreSQL
-	docker compose up -d postgres
+up: ## Start PostgreSQL + MinIO (local S3)
+	docker compose up -d postgres minio minio-init
 
 down: ## Stop the stack
 	docker compose down
@@ -95,6 +97,9 @@ e2e-real: build up ## Supervised real Zalo -> Gemini -> confirmation E2E (resets
 API_FLAGS ?=
 run-local: build migrate ## Run api + both workers together (Ctrl-C stops all)
 	@scripts/run-local.sh $(API_FLAGS)
+
+vm-rebuild: ## VM: start postgres, migrate, rebuild binaries, restart systemd units
+	@sh scripts/vm-rebuild.sh
 
 clean:
 	rm -rf $(BIN) data

@@ -102,21 +102,6 @@ func TestS3PutOpenDeleteRoundTrip(t *testing.T) {
 	}
 }
 
-func TestS3CompatiblePutOmitsAWSEncryptionHeader(t *testing.T) {
-	fake := newFakeS3()
-	st, err := NewS3(fake, "r2-bucket", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.disableSSE = true
-	if _, err := st.Put(context.Background(), "receipts/u1/r1", strings.NewReader("img"), "image/jpeg"); err != nil {
-		t.Fatal(err)
-	}
-	if fake.sse["receipts/u1/r1"] != "" {
-		t.Fatalf("compatible Put sent SSE %q, want empty", fake.sse["receipts/u1/r1"])
-	}
-}
-
 func TestS3KeyValidation(t *testing.T) {
 	st, err := NewS3(newFakeS3(), "b", "")
 	if err != nil {

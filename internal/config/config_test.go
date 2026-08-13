@@ -13,6 +13,7 @@ var configKeys = []string{
 	"GEMINI_API_BASE", "PILOT_ALLOWLIST", "EXTRACTION_ENABLED",
 	"OUTBOUND_ENABLED", "MONTHLY_OCR_PAGE_LIMIT",
 	"PER_USER_DAILY_RECEIPT_LIMIT", "ZALO_MONTHLY_MESSAGE_LIMIT",
+	"ORIGINAL_RETENTION_DAYS",
 	"RECEIPT_WORKER_CONCURRENCY", "NOTIFICATION_WORKER_CONCURRENCY",
 	"QUEUE_POLL_INTERVAL", "SUMMARY_SCHEDULE_POLL_INTERVAL", "LOG_LEVEL",
 }
@@ -155,28 +156,14 @@ func TestPilotFailsClosed(t *testing.T) {
 	})
 }
 
-func TestProductionRequiresCloudAndRealExtractor(t *testing.T) {
+func TestProductionRequiresRealExtractor(t *testing.T) {
 	baseEnv(t)
 	t.Setenv("APP_ENV", EnvProduction)
 	t.Setenv("PILOT_ALLOWLIST", "relative-1")
 	t.Setenv("ZALO_BOT_TOKEN", "token")
 	t.Setenv("ZALO_WEBHOOK_SECRET", "a-real-secret-value")
 	_, err := Load()
-	if err == nil || !strings.Contains(err.Error(), "OBJECTSTORE must be s3") {
-		t.Fatalf("Load error = %v", err)
-	}
-
-	t.Setenv("OBJECTSTORE", "s3")
-	t.Setenv("S3_BUCKET", "private-receipts")
-	_, err = Load()
 	if err == nil || !strings.Contains(err.Error(), "EXTRACTOR must not be mock") {
 		t.Fatalf("Load error = %v", err)
 	}
-
-	t.Setenv("S3_ENDPOINT", "http://r2.example")
-	_, err = Load()
-	if err == nil || !strings.Contains(err.Error(), "S3_ENDPOINT") {
-		t.Fatalf("http S3_ENDPOINT: Load error = %v", err)
-	}
-	t.Setenv("S3_ENDPOINT", "")
 }

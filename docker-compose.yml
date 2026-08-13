@@ -1,6 +1,5 @@
-# Local development stack. No cloud services: PostgreSQL is the only
-# infrastructure dependency. Queue, object storage and extraction are
-# process-local adapters (see internal/platform and internal/extraction).
+# Local development stack. PostgreSQL is required; MinIO is the local
+# S3-compatible object store (no AWS). Queue and extraction stay in-process.
 services:
   postgres:
     image: postgres:16-alpine
@@ -21,5 +20,40 @@ services:
       timeout: 3s
       retries: 20
 
+  minio:
+    image: minio/minio:latest
+    container_name: zl-expese-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "127.0.0.1:${MINIO_API_PORT:-9000}:9000"
+      - "127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: zl-expese-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      S3_BUCKET: ${S3_BUCKET:-zl-expense-receipts}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" && mc mb --ignore-existing "local/$$S3_BUCKET"
+    restart: "no"
+
 volumes:
   pgdata:
+  minio-data:

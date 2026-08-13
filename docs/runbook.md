@@ -18,6 +18,9 @@ Startup order: postgres → migrate → workers/api (any order; all retry).
 Health check: `GET /healthz` (DB ping). Graceful stop: SIGINT/SIGTERM —
 in-flight jobs finish, unacked jobs return via visibility timeout.
 
+Always-on VM (Oracle): rebuild with `make vm-rebuild`. First-time systemd
+install and env notes are in [`docs/vm-pilot.md`](vm-pilot.md).
+
 ## Demo / smoke
 
 - `make playground` — interactive local chat at `http://127.0.0.1:8090`.

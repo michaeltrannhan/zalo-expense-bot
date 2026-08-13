@@ -11,6 +11,7 @@ Critical hardening work is tracked in
 [`docs/critical-fix-checkpoints.md`](docs/critical-fix-checkpoints.md).
 Remaining deployment and operational gaps are ranked in
 [`docs/repository-audit.md`](docs/repository-audit.md).
+Oracle / always-on VM rebuild and systemd: [`docs/vm-pilot.md`](docs/vm-pilot.md).
 Current milestone: **Phase 4 feature-complete, including a discoverable
 settings surface, opt-in scheduled summaries, and a browser local lab**;
 the default stack stays fully local
@@ -195,7 +196,7 @@ Ctrl-C stops all three processes cleanly. Logs are JSON on stdout;
 
 | Target | Purpose |
 |---|---|
-| `make up` / `make down` | start/stop PostgreSQL |
+| `make up` / `make down` | start/stop PostgreSQL + MinIO |
 | `make migrate` | apply migrations |
 | `make playground` | interactive local browser chat/settings/receipt lab |
 | `make simulate` | deterministic end-to-end demo with assertions (`-keep` keeps data) |
@@ -206,6 +207,7 @@ Ctrl-C stops all three processes cleanly. Logs are JSON on stdout;
 | `make test-integration` | tests against real PostgreSQL |
 | `make race` | race-enabled integration run |
 | `make lint` | gofmt + go vet |
+| `make vm-rebuild` | VM: postgres + migrate + build + restart systemd units |
 
 ## Cost controls and kill switches (env)
 
