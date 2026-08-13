@@ -6,8 +6,9 @@ root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 cd "$root"
 if [ -f "$root/.env" ]; then
 	tmp=$(mktemp)
-	# Drop CR so KEY\r is not a different name than KEY.
-	tr -d '\r' < "$root/.env" > "$tmp"
+	# Drop CR, then insert a newline when two KEY= assignments were glued
+	# (e.g. LOG_LEVEL=infoZALO_WEBHOOK_SECRET=...).
+	tr -d '\r' < "$root/.env" | sed -E 's/([a-z0-9"])([A-Z][A-Z0-9_]+=)/\1\n\2/g' > "$tmp"
 	set -a
 	# shellcheck disable=SC1090
 	. "$tmp"
