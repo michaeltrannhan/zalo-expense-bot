@@ -21,9 +21,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
-
 	"zl-expese-bot/internal/bot"
 	"zl-expese-bot/internal/categorisation"
 	"zl-expese-bot/internal/config"
@@ -108,17 +105,12 @@ func messagingProvider(cfg config.Config, log *slog.Logger) messaging.Provider {
 }
 
 // objectStore builds the receipt object store: local filesystem by default,
-// S3 when OBJECTSTORE=s3 (P3-A02). AWS credentials and region come from the
-// standard SDK chain.
+// S3 (or S3-compatible such as Cloudflare R2) when OBJECTSTORE=s3.
 func objectStore(ctx context.Context, cfg config.Config) (objectstore.Store, error) {
 	if cfg.ObjectStoreBackend != "s3" {
 		return objectstore.NewLocal(cfg.DataDir)
 	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("load AWS config: %w", err)
-	}
-	return objectstore.NewS3(awss3.NewFromConfig(awsCfg), cfg.S3Bucket, cfg.S3Prefix)
+	return objectstore.ConnectS3(ctx, cfg.S3Bucket, cfg.S3Prefix, cfg.S3Endpoint, cfg.S3Region)
 }
 
 // serve runs the webhook HTTP server until ctx is cancelled, then shuts

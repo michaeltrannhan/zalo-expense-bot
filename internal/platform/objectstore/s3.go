@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -25,14 +26,16 @@ type S3API interface {
 	DeleteObject(ctx context.Context, in *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
-// S3 implements Store over Amazon S3 (plan P3-A02): a private bucket,
-// SSE-AES256 at rest, user-scoped keys, and sha256 computed locally on
-// upload. The bucket must block all public access; presigned access is a
+// S3 implements Store over Amazon S3 or an S3-compatible API (Cloudflare
+// R2, MinIO). AWS buckets get SSE-AES256; compatible endpoints skip that
+// header because they encrypt at rest themselves and often reject it.
+// The bucket must block all public access; presigned access is a
 // post-MVP decision (§11.3).
 type S3 struct {
-	client S3API
-	bucket string
-	prefix string
+	client     S3API
+	bucket     string
+	prefix     string
+	disableSSE bool
 }
 
 var _ Store = (*S3)(nil)
@@ -46,6 +49,37 @@ func NewS3(client S3API, bucket, prefix string) (*S3, error) {
 		return nil, fmt.Errorf("objectstore: S3 bucket is required")
 	}
 	return &S3{client: client, bucket: bucket, prefix: strings.Trim(prefix, "/")}, nil
+}
+
+// ConnectS3 builds an S3 (or S3-compatible) store from process env.
+// endpoint, when set, is the HTTPS API base (for example Cloudflare R2
+// https://<accountid>.r2.cloudflarestorage.com). Credentials still come
+// from the AWS SDK chain (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
+func ConnectS3(ctx context.Context, bucket, prefix, endpoint, region string) (*S3, error) {
+	endpoint = strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	if region == "" && endpoint != "" {
+		region = "auto"
+	}
+	var loadOpts []func(*awsconfig.LoadOptions) error
+	if region != "" {
+		loadOpts = append(loadOpts, awsconfig.WithRegion(region))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("load S3 config: %w", err)
+	}
+	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+			o.UsePathStyle = true
+		}
+	})
+	st, err := NewS3(client, bucket, prefix)
+	if err != nil {
+		return nil, err
+	}
+	st.disableSSE = endpoint != ""
+	return st, nil
 }
 
 func (s *S3) fullKey(key string) string {
@@ -67,13 +101,16 @@ func (s *S3) Put(ctx context.Context, key string, r io.Reader, contentType strin
 		return Stored{}, domain.E(domain.CodeTransient, "read object bytes", err)
 	}
 	sum := sha256.Sum256(data)
-	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
-		Bucket:               aws.String(s.bucket),
-		Key:                  aws.String(s.fullKey(key)),
-		Body:                 bytes.NewReader(data),
-		ContentType:          aws.String(contentType),
-		ServerSideEncryption: s3types.ServerSideEncryptionAes256,
-	})
+	in := &s3.PutObjectInput{
+		Bucket:      aws.String(s.bucket),
+		Key:         aws.String(s.fullKey(key)),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String(contentType),
+	}
+	if !s.disableSSE {
+		in.ServerSideEncryption = s3types.ServerSideEncryptionAes256
+	}
+	_, err = s.client.PutObject(ctx, in)
 	if err != nil {
 		return Stored{}, classifyS3("put object", err)
 	}

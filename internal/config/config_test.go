@@ -8,7 +8,8 @@ import (
 var configKeys = []string{
 	"APP_ENV", "DATABASE_URL", "ZALO_BOT_TOKEN", "ZALO_WEBHOOK_SECRET",
 	"ZALO_API_BASE", "LISTEN_ADDR", "DATA_DIR", "OBJECTSTORE", "S3_BUCKET",
-	"S3_PREFIX", "EXTRACTOR", "GEMINI_API_KEY", "GEMINI_MODEL",
+	"S3_PREFIX", "S3_ENDPOINT", "S3_REGION", "EXTRACTOR", "GEMINI_API_KEY",
+	"GEMINI_MODEL",
 	"GEMINI_API_BASE", "PILOT_ALLOWLIST", "EXTRACTION_ENABLED",
 	"OUTBOUND_ENABLED", "MONTHLY_OCR_PAGE_LIMIT",
 	"PER_USER_DAILY_RECEIPT_LIMIT", "ZALO_MONTHLY_MESSAGE_LIMIT",
@@ -171,4 +172,11 @@ func TestProductionRequiresCloudAndRealExtractor(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "EXTRACTOR must not be mock") {
 		t.Fatalf("Load error = %v", err)
 	}
+
+	t.Setenv("S3_ENDPOINT", "http://r2.example")
+	_, err = Load()
+	if err == nil || !strings.Contains(err.Error(), "S3_ENDPOINT") {
+		t.Fatalf("http S3_ENDPOINT: Load error = %v", err)
+	}
+	t.Setenv("S3_ENDPOINT", "")
 }

@@ -33,6 +33,8 @@ type Config struct {
 	ObjectStoreBackend string
 	S3Bucket           string
 	S3Prefix           string
+	S3Endpoint         string
+	S3Region           string
 
 	ExtractionBackend string
 	GeminiAPIKey      string
@@ -107,6 +109,8 @@ func Load() (Config, error) {
 		ObjectStoreBackend:            envStr("OBJECTSTORE", "local"),
 		S3Bucket:                      strings.TrimSpace(os.Getenv("S3_BUCKET")),
 		S3Prefix:                      strings.TrimSpace(os.Getenv("S3_PREFIX")),
+		S3Endpoint:                    strings.TrimRight(strings.TrimSpace(os.Getenv("S3_ENDPOINT")), "/"),
+		S3Region:                      strings.TrimSpace(os.Getenv("S3_REGION")),
 		ExtractionBackend:             envStr("EXTRACTOR", "mock"),
 		GeminiAPIKey:                  strings.TrimSpace(os.Getenv("GEMINI_API_KEY")),
 		GeminiModel:                   envStr("GEMINI_MODEL", "gemini-3.6-flash"),
@@ -146,9 +150,17 @@ func (c Config) validate() error {
 	}
 	switch c.ObjectStoreBackend {
 	case "local":
+		if c.S3Endpoint != "" {
+			return fmt.Errorf("S3_ENDPOINT is only valid when OBJECTSTORE=s3")
+		}
 	case "s3":
 		if c.S3Bucket == "" {
 			return fmt.Errorf("S3_BUCKET is required when OBJECTSTORE=s3")
+		}
+		if c.S3Endpoint != "" {
+			if err := requireHTTPS("S3_ENDPOINT", c.S3Endpoint); err != nil {
+				return err
+			}
 		}
 	default:
 		return fmt.Errorf("OBJECTSTORE must be local or s3, got %q", c.ObjectStoreBackend)
