@@ -85,6 +85,14 @@ func run() error {
 		if !ok {
 			return errors.New("-poll requires ZALO_BOT_TOKEN (nothing to poll without a real bot)")
 		}
+		// Long-poll does not serve the Zalo webhook, but /healthz must still
+		// bind so systemd and curl can tell the process is alive.
+		go func() {
+			if err := serveHealthz(ctx, log, cfg, pool); err != nil &&
+				!errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
+				log.Error("healthz server stopped", slog.String("error", err.Error()))
+			}
+		}()
 		return pollLoop(ctx, log, client, handler)
 	}
 	return serve(ctx, log, cfg, pool, provider, handler)
@@ -121,7 +129,19 @@ func serve(ctx context.Context, log *slog.Logger, cfg config.Config, pool *pgxpo
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /webhook/zalo", s.webhook)
 	mux.HandleFunc("GET /healthz", s.healthz)
+	return listenHTTP(ctx, log, cfg, mux)
+}
 
+// serveHealthz binds LISTEN_ADDR with only GET /healthz. Used in -poll so
+// the process can ingest Zalo updates without exposing the webhook.
+func serveHealthz(ctx context.Context, log *slog.Logger, cfg config.Config, pool *pgxpool.Pool) error {
+	s := &server{pool: pool, log: log}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", s.healthz)
+	return listenHTTP(ctx, log, cfg, mux)
+}
+
+func listenHTTP(ctx context.Context, log *slog.Logger, cfg config.Config, mux *http.ServeMux) error {
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
 		Handler:           mux,
@@ -133,9 +153,7 @@ func serve(ctx context.Context, log *slog.Logger, cfg config.Config, pool *pgxpo
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
-	log.Info("api listening",
-		slog.String("addr", cfg.ListenAddr),
-		slog.String("messaging", cfg.MessagingMode()))
+	log.Info("api listening", slog.String("addr", cfg.ListenAddr))
 
 	select {
 	case <-ctx.Done():
