@@ -28,8 +28,22 @@ if systemctl list-unit-files zl-expense-api.service >/dev/null 2>&1 &&
 	systemctl is-enabled zl-expense-api.service >/dev/null 2>&1; then
 	echo ">> restart systemd units"
 	sudo systemctl restart $units
+	sleep 2
 	sudo systemctl --no-pager --full status $units || true
-	echo "health: curl -sS http://127.0.0.1:8080/healthz"
+	if curl -sf -o /dev/null --connect-timeout 2 http://127.0.0.1:8080/healthz; then
+		echo "health: ok"
+	else
+		echo "health: failed — last api/worker errors:"
+		sudo journalctl -u zl-expense-api -u zl-expense-receipt-worker -u zl-expense-notification-worker -n 40 --no-pager --output=cat || true
+		echo
+		echo "foreground check (same .env as systemd):"
+		set -a
+		# shellcheck disable=SC1091
+		. ./.env
+		set +a
+		timeout 3 ./bin/api -poll || true
+		exit 1
+	fi
 else
 	echo "systemd units not installed yet. First time:"
 	echo "  sh scripts/install-vm-services.sh"
