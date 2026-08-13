@@ -7,11 +7,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"zl-expese-bot/db"
-	"zl-expese-bot/internal/config"
 	"zl-expese-bot/internal/logging"
 	"zl-expese-bot/internal/platform/migrate"
 	"zl-expese-bot/internal/platform/postgres"
@@ -25,18 +25,22 @@ func main() {
 }
 
 func run() error {
-	cfg, err := config.Load()
-	if err != nil {
-		return err
+	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if databaseURL == "" {
+		return fmt.Errorf("DATABASE_URL is required")
 	}
-	log := logging.New(cfg.LogLevel)
+	level := strings.TrimSpace(os.Getenv("LOG_LEVEL"))
+	if level == "" {
+		level = "info"
+	}
+	log := logging.New(level)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	pool, err := postgres.Connect(ctx, cfg.DatabaseURL)
+	pool, err := postgres.Connect(ctx, databaseURL)
 	if err != nil {
 		return err
 	}

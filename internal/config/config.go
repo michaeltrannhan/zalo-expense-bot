@@ -159,9 +159,7 @@ func (c Config) validate() error {
 	}
 	switch c.ObjectStoreBackend {
 	case "local":
-		if c.S3Endpoint != "" {
-			return fmt.Errorf("S3_ENDPOINT is only valid when OBJECTSTORE=s3")
-		}
+		// Leftover S3_ENDPOINT in .env is ignored; files go to DATA_DIR.
 	case "s3":
 		if c.S3Bucket == "" {
 			return fmt.Errorf("S3_BUCKET is required when OBJECTSTORE=s3")
