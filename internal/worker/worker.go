@@ -91,7 +91,8 @@ func loop(ctx context.Context, log *slog.Logger, q queue.Queue, cfg Config, hand
 			log.Warn("job failed transiently",
 				slog.String("job_id", job.ID.String()),
 				slog.String("kind", string(job.Kind)),
-				slog.String("error_class", string(domain.CodeOf(handleErr))))
+				slog.String("error_class", string(domain.CodeOf(handleErr))),
+				slog.String("error", handleErr.Error()))
 			if err := q.Nack(ctx, job.ID, job.ClaimToken, handleErr); err != nil {
 				if !errors.Is(err, queue.ErrStaleClaim) {
 					log.Error("nack failed", slog.String("job_id", job.ID.String()), slog.String("error", err.Error()))

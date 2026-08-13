@@ -159,14 +159,18 @@ func (q *PG) Nack(ctx context.Context, id, claimToken uuid.UUID, cause error) er
 		}
 		return fmt.Errorf("nack read attempts: %w", err)
 	}
-	backoff := math.Min(math.Pow(2, float64(attempts)), 300)
+	// Compute the deadline in Go. Postgres infers `$3 + make_interval(...)`
+	// as interval when $3 is an untyped parameter, which cannot be assigned
+	// to timestamptz run_after (SQLSTATE 42804).
+	secs := int64(math.Min(math.Pow(2, float64(attempts)), 300))
+	runAfter := now.Add(time.Duration(secs) * time.Second)
 	tag, err := q.pool.Exec(ctx, `
 		UPDATE queue_jobs
 		SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
-		    run_after = $3 + make_interval(secs => $4),
+		    run_after = $4,
 		    last_error = $5, claim_token = NULL, updated_at = $3
 		WHERE id = $1 AND claim_token = $2 AND status = 'running'`,
-		id, claimToken, now, backoff, truncateErr(cause))
+		id, claimToken, now, runAfter, truncateErr(cause))
 	if err != nil {
 		return fmt.Errorf("nack: %w", err)
 	}

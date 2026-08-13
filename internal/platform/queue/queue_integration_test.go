@@ -79,3 +79,40 @@ func TestHeartbeatExtendsLease(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestNackSchedulesBackoff(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	clk := clock.Real{}
+	q := queue.NewPG(pool, clk)
+	ctx := context.Background()
+
+	if _, err := q.Enqueue(ctx, domain.JobReceiptProcess, []byte(`{"v":1}`), nil, 5); err != nil {
+		t.Fatal(err)
+	}
+	job, err := q.Dequeue(ctx, []domain.JobKind{domain.JobReceiptProcess}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Nack(ctx, job.ID, job.ClaimToken, errors.New("gemini timeout")); err != nil {
+		t.Fatalf("nack: %v", err)
+	}
+
+	var status, lastError string
+	var runAfter time.Time
+	err = pool.QueryRow(ctx, `
+		SELECT status, last_error, run_after FROM queue_jobs WHERE id = $1`, job.ID).
+		Scan(&status, &lastError, &runAfter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != "queued" {
+		t.Fatalf("status = %s, want queued", status)
+	}
+	if lastError == "" {
+		t.Fatal("last_error empty")
+	}
+	if !runAfter.After(clk.Now()) {
+		t.Fatalf("run_after %s is not in the future", runAfter)
+	}
+}
+
