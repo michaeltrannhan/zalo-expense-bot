@@ -18,8 +18,8 @@ import (
 	"zl-expese-bot/internal/insight"
 	"zl-expese-bot/internal/logging"
 	"zl-expese-bot/internal/messaging"
-	"zl-expese-bot/internal/messaging/logprovider"
-	"zl-expese-bot/internal/messaging/zalo"
+	_ "zl-expese-bot/internal/messaging/logprovider"
+	_ "zl-expese-bot/internal/messaging/zalo"
 	"zl-expese-bot/internal/notify"
 	"zl-expese-bot/internal/platform/clock"
 	"zl-expese-bot/internal/platform/postgres"
@@ -55,10 +55,10 @@ func run() error {
 	st := store.New(pool)
 	clk := clock.Real{}
 	q := queue.NewPG(pool, clk)
-	provider := messagingProvider(cfg, log)
+	provider := messaging.NewFromConfig(cfg, log)
 	replies := notify.NewEnqueuer(st, q, clk)
 	sender := notify.NewSender(st, provider, clk, log, cfg.OutboundEnabled, cfg.ZaloMonthlyMessageLimit)
-	summaryRunner := summaryschedule.NewRunner(st, insight.NewService(pool, clk), replies, clk, log)
+	summaryRunner := summaryschedule.NewRunner(st, insight.NewService(st), replies, clk, log)
 
 	log.Info("notification worker starting",
 		slog.Int("concurrency", cfg.NotificationWorkerConcurrency),
@@ -72,17 +72,4 @@ func run() error {
 		PollInterval: cfg.QueuePollInterval,
 	}, sender.Handle)
 	return nil
-}
-
-// messagingProvider picks the messaging adapter: the real Zalo Bot API when
-// a token is configured, otherwise the log provider that never dials out.
-func messagingProvider(cfg config.Config, log *slog.Logger) messaging.Provider {
-	if cfg.MessagingMode() == "zalo" {
-		return zalo.New(zalo.Config{
-			Token:         cfg.ZaloBotToken,
-			WebhookSecret: cfg.ZaloWebhookSecret,
-			APIBase:       cfg.ZaloAPIBase,
-		})
-	}
-	return logprovider.New(log)
 }

@@ -14,20 +14,17 @@ import (
 	"syscall"
 	"time"
 
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	awstextract "github.com/aws/aws-sdk-go-v2/service/textract"
-
 	"zl-expese-bot/internal/categorisation"
 	"zl-expese-bot/internal/config"
 	"zl-expese-bot/internal/domain"
 	"zl-expese-bot/internal/extraction"
-	"zl-expese-bot/internal/extraction/gemini"
-	"zl-expese-bot/internal/extraction/mock"
-	textractx "zl-expese-bot/internal/extraction/textract"
+	_ "zl-expese-bot/internal/extraction/gemini"
+	_ "zl-expese-bot/internal/extraction/mock"
+	_ "zl-expese-bot/internal/extraction/textract"
 	"zl-expese-bot/internal/logging"
 	"zl-expese-bot/internal/messaging"
-	"zl-expese-bot/internal/messaging/logprovider"
-	"zl-expese-bot/internal/messaging/zalo"
+	_ "zl-expese-bot/internal/messaging/logprovider"
+	_ "zl-expese-bot/internal/messaging/zalo"
 	"zl-expese-bot/internal/notify"
 	"zl-expese-bot/internal/platform/clock"
 	"zl-expese-bot/internal/platform/objectstore"
@@ -68,15 +65,15 @@ func run() error {
 	st := store.New(pool)
 	clk := clock.Real{}
 	q := queue.NewPG(pool, clk)
-	objects, err := objectStore(ctx, cfg)
+	objects, err := objectstore.NewFromConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	provider := messagingProvider(cfg, log)
+	provider := messaging.NewFromConfig(cfg, log)
 	replies := notify.NewEnqueuer(st, q, clk)
 	cats := categorisation.NewService(st, clk)
 
-	extractor, err := extractionBackend(ctx, cfg)
+	extractor, err := extraction.NewFromConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -124,50 +121,4 @@ func run() error {
 		return processor.Handle(ctx, job)
 	})
 	return nil
-}
-
-// messagingProvider picks the messaging adapter: the real Zalo Bot API when
-// a token is configured (needed to download receipt media), otherwise the
-// log provider that never dials out.
-func messagingProvider(cfg config.Config, log *slog.Logger) messaging.Provider {
-	if cfg.MessagingMode() == "zalo" {
-		return zalo.New(zalo.Config{
-			Token:         cfg.ZaloBotToken,
-			WebhookSecret: cfg.ZaloWebhookSecret,
-			APIBase:       cfg.ZaloAPIBase,
-		})
-	}
-	return logprovider.New(log)
-}
-
-// objectStore builds the receipt object store: local filesystem by default,
-// S3 (or S3-compatible such as Cloudflare R2) when OBJECTSTORE=s3.
-func objectStore(ctx context.Context, cfg config.Config) (objectstore.Store, error) {
-	if cfg.ObjectStoreBackend != "s3" {
-		return objectstore.NewLocal(cfg.DataDir)
-	}
-	return objectstore.ConnectS3(ctx, cfg.S3Bucket, cfg.S3Prefix, cfg.S3Endpoint, cfg.S3Region)
-}
-
-// extractionBackend builds the receipt extractor: the deterministic mock by
-// default, Amazon Textract AnalyzeExpense (EXTRACTOR=textract, P3-B01), or
-// a vision LLM (EXTRACTOR=gemini). AWS credentials and region come from the
-// standard SDK chain; Gemini uses GEMINI_API_KEY.
-func extractionBackend(ctx context.Context, cfg config.Config) (extraction.Extractor, error) {
-	switch cfg.ExtractionBackend {
-	case "textract":
-		awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("load AWS config: %w", err)
-		}
-		return textractx.New(awstextract.NewFromConfig(awsCfg)), nil
-	case "gemini":
-		return gemini.New(gemini.Config{
-			APIKey:  cfg.GeminiAPIKey,
-			Model:   cfg.GeminiModel,
-			APIBase: cfg.GeminiAPIBase,
-		}), nil
-	default:
-		return mock.New(), nil
-	}
 }

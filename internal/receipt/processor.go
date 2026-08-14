@@ -62,57 +62,110 @@ func NewProcessor(st *store.Store, objects objectstore.Store, ex extraction.Extr
 // return nil so the worker Acks. Transient failures mark the receipt
 // failed_transient and return CodeTransient so the worker Nacks with
 // backoff; the retry resumes through the state machine.
+//
+// Download and OCR run outside the user advisory lock; the lock covers
+// only DB mutations. Holding it across Gemini/Zalo HTTP serialized every
+// receipt for that user behind a 45s ceiling.
 func (p *Processor) Handle(ctx context.Context, job *domain.QueueJob) error {
 	var payload events.ReceiptJob
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return domain.E(domain.CodeValidation, "decode receipt job", err)
 	}
-	return p.st.WithUserLock(ctx, payload.UserID, func(lockedCtx context.Context) error {
-		user, err := p.st.GetUser(lockedCtx, payload.UserID)
+
+	var prep *receiptPrep
+	err := p.st.WithUserLock(ctx, payload.UserID, func(lockedCtx context.Context) error {
+		var err error
+		prep, err = p.prepareReceipt(lockedCtx, job, payload)
 		if err != nil {
-			if domain.IsCode(err, domain.CodeNotFound) {
-				return nil
+			return p.ackPolicy(lockedCtx, payload.ReceiptID, err)
+		}
+		return nil
+	})
+	if err != nil || prep == nil || prep.skip {
+		return err
+	}
+
+	data, digest, contentType, err := p.loadImageBytes(ctx, prep)
+	if err != nil {
+		return p.withLockedReceipt(ctx, payload, func(lockedCtx context.Context, r *domain.ReceiptDocument) error {
+			if domain.IsCode(err, domain.CodeConflict) {
+				return p.conflictAsDone(lockedCtx, r.ID, err)
 			}
-			return err
+			if domain.IsCode(err, domain.CodeValidation) && strings.Contains(err.Error(), "duplicate receipt") {
+				return p.failWith(lockedCtx, r, payload, prep.attempt, "duplicate", conversation.DuplicateReceiptText())
+			}
+			return p.fail(lockedCtx, r, payload, prep.attempt, err, conversation.UnsupportedImageText())
+		})
+	}
+
+	err = p.st.WithUserLock(ctx, payload.UserID, func(lockedCtx context.Context) error {
+		armed, err := p.armExtraction(lockedCtx, payload, prep, data, digest, contentType)
+		if err != nil {
+			return p.ackPolicy(lockedCtx, payload.ReceiptID, err)
 		}
-		if user.Status == domain.UserDeleted || user.DeletedAt != nil {
-			return nil
-		}
-		err = p.handleLocked(lockedCtx, job, payload)
+		prep.skip = !armed
+		return nil
+	})
+	if err != nil || prep.skip {
+		return err
+	}
+
+	result, extractErr := p.extractor.Extract(ctx, bytes.NewReader(data), extraction.Input{
+		ReceiptID:   payload.ReceiptID.String(),
+		SHA256:      digest,
+		ContentType: contentType,
+	})
+
+	return p.st.WithUserLock(ctx, payload.UserID, func(lockedCtx context.Context) error {
+		err := p.finishExtraction(lockedCtx, payload, prep.attempt, result, extractErr)
 		return p.ackPolicy(lockedCtx, payload.ReceiptID, err)
 	})
 }
 
-func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payload events.ReceiptJob) error {
+type receiptPrep struct {
+	skip      bool
+	needFetch bool
+	receipt   *domain.ReceiptDocument
+	attempt   int
+}
+
+func (p *Processor) prepareReceipt(ctx context.Context, job *domain.QueueJob, payload events.ReceiptJob) (*receiptPrep, error) {
+	user, err := p.st.GetUser(ctx, payload.UserID)
+	if err != nil {
+		if domain.IsCode(err, domain.CodeNotFound) {
+			return &receiptPrep{skip: true}, nil
+		}
+		return nil, err
+	}
+	if user.Status == domain.UserDeleted || user.DeletedAt != nil {
+		return &receiptPrep{skip: true}, nil
+	}
+
 	r, err := p.st.GetReceipt(ctx, payload.ReceiptID)
 	if err != nil {
 		if domain.IsCode(err, domain.CodeNotFound) {
-			return nil // receipt deleted while queued; nothing to do
+			return &receiptPrep{skip: true}, nil
 		}
-		return err
+		return nil, err
 	}
 	if r.UserID != payload.UserID {
-		return domain.E(domain.CodeValidation, "receipt job user does not own receipt", nil)
+		return nil, domain.E(domain.CodeValidation, "receipt job user does not own receipt", nil)
 	}
 
-	// Idempotent resume: terminal states are done; mid-pipeline stages
-	// continue from their checkpoint after a crash or lease reclaim.
 	switch r.Status {
 	case domain.ReceiptReviewRequired, domain.ReceiptConfirmed, domain.ReceiptDeleted,
 		domain.ReceiptFailedPermanent:
-		return nil
+		return &receiptPrep{skip: true}, nil
 	case domain.ReceiptFailedTransient:
 		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptFailedTransient, domain.ReceiptQueued); err != nil {
-			return p.conflictAsDone(ctx, r.ID, err)
+			return nil, p.conflictAsDone(ctx, r.ID, err)
 		}
 		r.Status = domain.ReceiptQueued
 	case domain.ReceiptQueued, domain.ReceiptDownloading, domain.ReceiptStored, domain.ReceiptExtracting:
-		// fall through and resume
 	default:
-		return nil // received or unknown — nothing for this job to do
+		return &receiptPrep{skip: true}, nil
 	}
 
-	// Dequeue already incremented attempts; use that as the attempt number.
 	attempt := job.Attempts
 	if attempt < 1 {
 		attempt = 1
@@ -121,43 +174,102 @@ func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payl
 		p.log.Warn("record attempt start failed", slog.String("error", err.Error()))
 	}
 
-	data, contentType, err := p.ensureStoredImage(ctx, r)
-	if err != nil {
-		if domain.IsCode(err, domain.CodeConflict) {
-			return p.conflictAsDone(ctx, r.ID, err)
+	if r.Status == domain.ReceiptQueued {
+		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptQueued, domain.ReceiptDownloading); err != nil {
+			return nil, p.conflictAsDone(ctx, r.ID, err)
 		}
-		if domain.IsCode(err, domain.CodeValidation) && strings.Contains(err.Error(), "duplicate receipt") {
-			return p.failWith(ctx, r, payload, attempt, "duplicate", conversation.DuplicateReceiptText())
-		}
-		return p.fail(ctx, r, payload, attempt, err, conversation.UnsupportedImageText())
+		r.Status = domain.ReceiptDownloading
 	}
-	// Reload after stage transitions inside ensureStoredImage.
+
+	needFetch := r.StorageKey == ""
+	return &receiptPrep{needFetch: needFetch, receipt: r, attempt: attempt}, nil
+}
+
+func (p *Processor) loadImageBytes(ctx context.Context, prep *receiptPrep) ([]byte, string, string, error) {
+	r := prep.receipt
+	if !prep.needFetch && r.StorageKey != "" {
+		data, contentType, err := p.readStored(ctx, r)
+		return data, r.SHA256, contentType, err
+	}
+
+	data, _, contentType, err := p.fetchAndValidate(ctx, r)
+	if err != nil {
+		return nil, "", "", err
+	}
+	stored, err := p.objects.Put(ctx, StorageKey(r.UserID, r.ID), bytes.NewReader(data), contentType)
+	if err != nil {
+		return nil, "", "", domain.E(domain.CodeTransient, "object store put", err)
+	}
+	r.StorageKey = stored.Key
+	r.SHA256 = stored.SHA256
+	r.ContentType = contentType
+	r.ByteSize = stored.ByteSize
+	return data, stored.SHA256, contentType, nil
+}
+
+func (p *Processor) armExtraction(ctx context.Context, payload events.ReceiptJob, prep *receiptPrep, data []byte, digest, contentType string) (bool, error) {
+	r, err := p.st.GetReceipt(ctx, payload.ReceiptID)
+	if err != nil {
+		if domain.IsCode(err, domain.CodeNotFound) {
+			return false, nil
+		}
+		return false, err
+	}
+	switch r.Status {
+	case domain.ReceiptReviewRequired, domain.ReceiptConfirmed, domain.ReceiptDeleted,
+		domain.ReceiptFailedPermanent:
+		return false, nil
+	}
+
+	if digest != "" {
+		if dup, derr := p.st.FindReceiptByHash(ctx, r.UserID, digest); derr == nil && dup.ID != r.ID {
+			return false, p.failWith(ctx, r, payload, prep.attempt, "duplicate", conversation.DuplicateReceiptText())
+		} else if derr != nil && !domain.IsCode(derr, domain.CodeNotFound) {
+			return false, derr
+		}
+	}
+
+	if prep.receipt != nil && prep.receipt.StorageKey != "" && r.StorageKey == "" {
+		size := prep.receipt.ByteSize
+		if size == 0 {
+			size = int64(len(data))
+		}
+		if err := p.st.SetReceiptStored(ctx, r.ID, prep.receipt.StorageKey, digest, contentType, size); err != nil {
+			return false, domain.E(domain.CodeTransient, "record stored receipt", err)
+		}
+	}
+
+	if r.Status == domain.ReceiptDownloading {
+		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptDownloading, domain.ReceiptStored); err != nil {
+			return false, p.conflictAsDone(ctx, r.ID, err)
+		}
+		r.Status = domain.ReceiptStored
+	}
+
 	if latest, lerr := p.st.GetReceipt(ctx, r.ID); lerr == nil {
 		r = latest
 	}
 
 	if r.Status == domain.ReceiptStored {
 		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptStored, domain.ReceiptExtracting); err != nil {
-			return p.conflictAsDone(ctx, r.ID, err)
+			return false, p.conflictAsDone(ctx, r.ID, err)
 		}
 		r.Status = domain.ReceiptExtracting
 	}
-
 	if r.Status != domain.ReceiptExtracting {
-		return domain.Ef(domain.CodeInternal, nil, "receipt %s not extracting after store", r.ID)
+		return false, domain.Ef(domain.CodeInternal, nil, "receipt %s not extracting after store", r.ID)
 	}
 
-	// Kill switch and monthly OCR quota, enforced in code (plan §13.1).
 	if !p.ExtractionEnabled {
-		return p.failWith(ctx, r, payload, attempt, "kill_switch", conversation.OCRDisabledText())
+		return false, p.failWith(ctx, r, payload, prep.attempt, "kill_switch", conversation.OCRDisabledText())
 	}
 	period := p.clk.Now().Format("2006-01")
 	count, err := p.st.IncrementUsage(ctx, "global", "", period, "ocr_pages", 1, p.MonthlyOCRLimit)
 	if err != nil {
-		return p.fail(ctx, r, payload, attempt, err, "")
+		return false, p.fail(ctx, r, payload, prep.attempt, err, "")
 	}
 	if p.MonthlyOCRLimit > 0 && count > p.MonthlyOCRLimit {
-		return p.failWith(ctx, r, payload, attempt, "quota", conversation.MonthlyQuotaText())
+		return false, p.failWith(ctx, r, payload, prep.attempt, "quota", conversation.MonthlyQuotaText())
 	}
 	if p.MonthlyOCRLimit > 0 {
 		if pct := count * 100 / p.MonthlyOCRLimit; pct == 70 || pct == 85 || pct == 95 {
@@ -165,17 +277,28 @@ func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payl
 				slog.Int64("count", count), slog.Int64("limit", p.MonthlyOCRLimit), slog.Int64("pct", pct))
 		}
 	}
+	return true, nil
+}
 
-	result, err := p.extractor.Extract(ctx, bytes.NewReader(data), extraction.Input{
-		ReceiptID:   r.ID.String(),
-		SHA256:      shaOf(data),
-		ContentType: contentType,
-	})
+func (p *Processor) finishExtraction(ctx context.Context, payload events.ReceiptJob, attempt int, result events.ExtractionResult, extractErr error) error {
+	r, err := p.st.GetReceipt(ctx, payload.ReceiptID)
 	if err != nil {
-		if domain.IsCode(err, domain.CodeUnsupported) {
+		if domain.IsCode(err, domain.CodeNotFound) {
+			return nil
+		}
+		return err
+	}
+	switch r.Status {
+	case domain.ReceiptReviewRequired, domain.ReceiptConfirmed, domain.ReceiptDeleted,
+		domain.ReceiptFailedPermanent:
+		return nil
+	}
+
+	if extractErr != nil {
+		if domain.IsCode(extractErr, domain.CodeUnsupported) {
 			return p.failWith(ctx, r, payload, attempt, "unsupported", conversation.UnsupportedImageText())
 		}
-		return p.fail(ctx, r, payload, attempt, err, "")
+		return p.fail(ctx, r, payload, attempt, extractErr, "")
 	}
 
 	tx, sug, err := p.buildAndPersistDraft(ctx, r, result)
@@ -192,10 +315,6 @@ func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payl
 		return err
 	}
 
-	// Soft-duplicate warning (P4-C01): exact-hash duplicates were stopped
-	// before storage; near-identical recorded transactions earn a gentle
-	// follow-up. Never auto-deletes — the user decides. A lookup failure
-	// must not fail the job: the card already landed.
 	if err := p.warnPossibleDuplicate(ctx, r.UserID, payload, tx); err != nil {
 		p.log.Warn("soft duplicate check failed", slog.Any("error", err))
 	}
@@ -206,54 +325,17 @@ func (p *Processor) handleLocked(ctx context.Context, job *domain.QueueJob, payl
 	return nil
 }
 
-// ensureStoredImage resumes download/store checkpoints until the receipt has
-// a durable object and status stored (or already extracting with a key).
-func (p *Processor) ensureStoredImage(ctx context.Context, r *domain.ReceiptDocument) ([]byte, string, error) {
-	if r.Status == domain.ReceiptExtracting && r.StorageKey != "" {
-		return p.readStored(ctx, r)
-	}
-	if r.Status == domain.ReceiptStored && r.StorageKey != "" {
-		return p.readStored(ctx, r)
-	}
-
-	if r.Status == domain.ReceiptQueued {
-		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptQueued, domain.ReceiptDownloading); err != nil {
-			return nil, "", err
+func (p *Processor) withLockedReceipt(ctx context.Context, payload events.ReceiptJob, fn func(context.Context, *domain.ReceiptDocument) error) error {
+	return p.st.WithUserLock(ctx, payload.UserID, func(lockedCtx context.Context) error {
+		r, err := p.st.GetReceipt(lockedCtx, payload.ReceiptID)
+		if err != nil {
+			if domain.IsCode(err, domain.CodeNotFound) {
+				return nil
+			}
+			return err
 		}
-		r.Status = domain.ReceiptDownloading
-	}
-
-	data, contentType, err := p.fetchAndValidate(ctx, r)
-	if err != nil {
-		return nil, "", err
-	}
-
-	// Duplicate content check before any paid work (plan §13.1).
-	if dup, derr := p.st.FindReceiptByHash(ctx, r.UserID, shaOf(data)); derr == nil && dup.ID != r.ID {
-		return nil, "", domain.E(domain.CodeValidation, "duplicate receipt image", nil)
-	} else if derr != nil && !domain.IsCode(derr, domain.CodeNotFound) {
-		return nil, "", derr
-	}
-
-	if r.Status == domain.ReceiptDownloading {
-		if err := p.st.TransitionReceipt(ctx, r.ID, domain.ReceiptDownloading, domain.ReceiptStored); err != nil {
-			return nil, "", err
-		}
-		r.Status = domain.ReceiptStored
-	}
-
-	stored, err := p.objects.Put(ctx, StorageKey(r.UserID, r.ID), bytes.NewReader(data), contentType)
-	if err != nil {
-		return nil, "", domain.E(domain.CodeTransient, "object store put", err)
-	}
-	if err := p.st.SetReceiptStored(ctx, r.ID, stored.Key, stored.SHA256, contentType, stored.ByteSize); err != nil {
-		return nil, "", domain.E(domain.CodeTransient, "record stored receipt", err)
-	}
-	r.StorageKey = stored.Key
-	r.SHA256 = stored.SHA256
-	r.ContentType = contentType
-	r.ByteSize = stored.ByteSize
-	return data, contentType, nil
+		return p.ackPolicy(lockedCtx, payload.ReceiptID, fn(lockedCtx, r))
+	})
 }
 
 func (p *Processor) readStored(ctx context.Context, r *domain.ReceiptDocument) ([]byte, string, error) {
@@ -292,9 +374,7 @@ func (p *Processor) warnPossibleDuplicate(ctx context.Context, userID uuid.UUID,
 	}
 	loc := time.UTC
 	if user, err := p.st.GetUser(ctx, userID); err == nil {
-		if l, lerr := time.LoadLocation(user.Timezone); lerr == nil {
-			loc = l
-		}
+		loc = user.Location()
 	}
 	lines := make([]conversation.DupLine, 0, len(dups))
 	for _, d := range dups {
@@ -310,17 +390,17 @@ func (p *Processor) warnPossibleDuplicate(ctx context.Context, userID uuid.UUID,
 
 // fetchAndValidate recovers the media reference from the retained provider
 // payload, downloads with provider guards, and validates image bytes.
-func (p *Processor) fetchAndValidate(ctx context.Context, r *domain.ReceiptDocument) ([]byte, string, error) {
+func (p *Processor) fetchAndValidate(ctx context.Context, r *domain.ReceiptDocument) ([]byte, string, string, error) {
 	if r.ProviderMessageID == nil {
-		return nil, "", domain.E(domain.CodeValidation, "receipt has no provider message", nil)
+		return nil, "", "", domain.E(domain.CodeValidation, "receipt has no provider message", nil)
 	}
 	pm, err := p.st.GetProviderMessage(ctx, *r.ProviderMessageID)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
 	evs, err := p.provider.ParseWebhook(ctx, pm.RawPayload)
 	if err != nil {
-		return nil, "", domain.E(domain.CodeValidation, "re-parse provider payload", err)
+		return nil, "", "", domain.E(domain.CodeValidation, "re-parse provider payload", err)
 	}
 	var ref *events.MediaReference
 	for i := range evs {
@@ -330,18 +410,18 @@ func (p *Processor) fetchAndValidate(ctx context.Context, r *domain.ReceiptDocum
 		}
 	}
 	if ref == nil {
-		return nil, "", domain.E(domain.CodeValidation, "provider payload has no media", nil)
+		return nil, "", "", domain.E(domain.CodeValidation, "provider payload has no media", nil)
 	}
 	rc, _, err := p.provider.DownloadMedia(ctx, *ref)
 	if err != nil {
-		return nil, "", err // adapter already classifies transient/permanent
+		return nil, "", "", err // adapter already classifies transient/permanent
 	}
 	defer rc.Close()
-	data, _, contentType, err := ValidateAndHash(rc, p.MaxImageBytes)
+	data, digest, contentType, err := ValidateAndHash(rc, p.MaxImageBytes)
 	if err != nil {
-		return nil, "", err
+		return nil, "", "", err
 	}
-	return data, contentType, nil
+	return data, digest, contentType, nil
 }
 
 // buildAndPersistDraft turns extraction into a transactional review draft.
@@ -350,10 +430,7 @@ func (p *Processor) buildAndPersistDraft(ctx context.Context, r *domain.ReceiptD
 	if err != nil {
 		return nil, categorisation.Suggestion{}, err
 	}
-	loc, lerr := time.LoadLocation(user.Timezone)
-	if lerr != nil {
-		loc = time.UTC
-	}
+	loc := user.Location()
 
 	merchantRaw := fieldRaw(result, "merchant")
 	var merchant *domain.Merchant
@@ -513,9 +590,7 @@ func (p *Processor) conflictAsDone(ctx context.Context, receiptID uuid.UUID, err
 func (p *Processor) renderCard(ctx context.Context, userID uuid.UUID, tx *domain.Transaction, result events.ExtractionResult, sug categorisation.Suggestion) string {
 	loc := time.UTC
 	if user, err := p.st.GetUser(ctx, userID); err == nil {
-		if l, lerr := time.LoadLocation(user.Timezone); lerr == nil {
-			loc = l
-		}
+		loc = user.Location()
 	}
 	merchant := tx.MerchantName
 	if merchant == "" {

@@ -32,7 +32,13 @@ const (
 	// maxConf caps self-reported model confidence (uncalibrated by nature).
 	maxConf = 0.95
 
-	defaultTimeout = 45 * time.Second // vision calls are slower than Textract
+	// defaultTimeout is a ceiling, not expected latency. Gemini 3.6 Flash
+	// thinks at medium by default; we send thinkingLevel=minimal so OCR
+	// stays a single-step extract instead of a long reasoning loop.
+	defaultTimeout = 45 * time.Second
+
+	ocrMaxEdge     = 2048
+	ocrJPEGQuality = 80
 )
 
 // Extractor implements extraction.Extractor via the Gemini generateContent
@@ -89,6 +95,11 @@ func (e *Extractor) Extract(ctx context.Context, r io.Reader, in extraction.Inpu
 	if mime == "" || mime == "text/plain" {
 		mime = "image/jpeg"
 	}
+	if mime != "text/plain" {
+		if scaled, scaledMIME, ok := downscaleForOCR(data); ok {
+			data, mime = scaled, scaledMIME
+		}
+	}
 
 	body, err := e.buildRequest(data, mime)
 	if err != nil {
@@ -133,6 +144,7 @@ func (e *Extractor) buildRequest(image []byte, mime string) ([]byte, error) {
 		}},
 		GenerationConfig: generationConfig{
 			ResponseMimeType: "application/json",
+			ThinkingConfig:   &thinkingConfig{ThinkingLevel: "minimal"},
 		},
 	}
 	return json.Marshal(req)
@@ -182,7 +194,15 @@ type inlineData struct {
 }
 
 type generationConfig struct {
-	ResponseMimeType string `json:"responseMimeType"`
+	ResponseMimeType string          `json:"responseMimeType"`
+	ThinkingConfig   *thinkingConfig `json:"thinkingConfig,omitempty"`
+}
+
+// thinkingConfig pins Gemini 3.x Flash to the lowest reasoning tier.
+// The model default is medium thinking, which dominates OCR latency.
+// Do not send thinkingBudget alongside thinkingLevel (API rejects both).
+type thinkingConfig struct {
+	ThinkingLevel string `json:"thinkingLevel,omitempty"`
 }
 
 type generateResponse struct {

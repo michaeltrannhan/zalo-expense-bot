@@ -45,8 +45,8 @@ func testHandler(t *testing.T, pool *pgxpool.Pool, q queue.Queue, cfg config.Con
 	clk := clock.Fixed{T: now}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	replies := notify.NewEnqueuer(st, q, clk)
-	h := NewHandler(st, pool, q, nil, replies, categorisation.NewService(st, clk),
-		insight.NewService(pool, clk), clk, log, cfg)
+	h := NewHandler(st, q, nil, replies, categorisation.NewService(st, clk),
+		insight.NewService(st), clk, log, cfg)
 	return h, st, clk
 }
 

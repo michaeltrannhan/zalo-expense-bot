@@ -151,7 +151,7 @@ func TestDeleteAccountPurgesCompleteUserGraph(t *testing.T) {
 		VALUES ($1, 'receipt_process', $2, $3)`,
 		uuid.New(), []byte(`{"user_id":"`+userID.String()+`"}`), "delete-job-"+userID.String())
 
-	report, err := DeleteAccount(ctx, pool, objects, dataDir, userID, pmID)
+	report, err := DeleteAccount(ctx, st, objects, dataDir, userID, pmID)
 	if err != nil {
 		t.Fatalf("DeleteAccount: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestDeleteAccountObjectFailureLeavesRetryableDatabaseState(t *testing.T) {
 		INSERT INTO receipt_documents (id, user_id, storage_key)
 		VALUES ($1, $2, 'receipts/fail.jpg')`, uuid.New(), userID)
 
-	if _, err := DeleteAccount(ctx, pool, failingObjectStore{}, "", userID, uuid.Nil); !domain.IsCode(err, domain.CodeTransient) {
+	if _, err := DeleteAccount(ctx, st, failingObjectStore{}, "", userID, uuid.Nil); !domain.IsCode(err, domain.CodeTransient) {
 		t.Fatalf("DeleteAccount error = %v, want transient", err)
 	}
 	var status string
@@ -309,7 +309,7 @@ func TestDeleteAccountWaitsForInFlightUserWork(t *testing.T) {
 
 	deleteDone := make(chan error, 1)
 	go func() {
-		_, err := DeleteAccount(ctx, pool, nil, "", userID, uuid.Nil)
+		_, err := DeleteAccount(ctx, st, nil, "", userID, uuid.Nil)
 		deleteDone <- err
 	}()
 	select {

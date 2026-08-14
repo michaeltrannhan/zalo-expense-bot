@@ -8,6 +8,7 @@ package categorisation
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -189,19 +190,13 @@ func (s *Service) SuggestCategory(ctx context.Context, userID uuid.UUID, m *doma
 	}, nil
 }
 
-// findCategory resolves a category by ID via the full taxonomy; the store
-// has no by-ID lookup. Returns (nil, nil) when the ID is unknown.
+// findCategory resolves a category by ID. Returns (nil, nil) when unknown.
 func (s *Service) findCategory(ctx context.Context, id uuid.UUID) (*domain.Category, error) {
-	cats, err := s.st.ListCategories(ctx)
-	if err != nil {
-		return nil, err
+	cat, err := s.st.GetCategoryByID(ctx, id)
+	if domain.IsCode(err, domain.CodeNotFound) {
+		return nil, nil
 	}
-	for i := range cats {
-		if cats[i].ID == id {
-			return &cats[i], nil
-		}
-	}
-	return nil, nil
+	return cat, err
 }
 
 // SuggestType proposes the transaction type: refund/transfer hints from the
@@ -249,4 +244,41 @@ func (s *Service) LearnFromConfirmation(ctx context.Context, userID uuid.UUID, t
 		Confidence:               ruleConfidence(count + 1),
 		LastConfirmedAt:          s.clk.Now(),
 	})
+}
+
+// GuessCategoryKey is the deterministic keyword fallback for manual entries;
+// user rules and corrections override it after one confirmation.
+func GuessCategoryKey(desc string) string {
+	_, key := normalise.NormaliseMerchant(desc)
+	if key == "" {
+		return ""
+	}
+	padded := " " + key + " "
+	type rule struct{ substr, category string }
+	rules := []rule{
+		{"ca phe", "an-uong"}, {"cafe", "an-uong"}, {"tra sua", "an-uong"},
+		{"an sang", "an-uong"}, {"an trua", "an-uong"}, {"an toi", "an-uong"},
+		{" an ", "an-uong"}, {"com ", "an-uong"}, {"pho ", "an-uong"},
+		{"bun ", "an-uong"}, {"do an", "an-uong"}, {"nuoc uong", "an-uong"},
+		{" cho ", "thuc-pham"}, {"sieu thi", "thuc-pham"}, {"tap hoa", "thuc-pham"},
+		{"rau ", "thuc-pham"}, {"thit ", "thuc-pham"},
+		{"grab", "di-lai"}, {"taxi", "di-lai"}, {"xang", "di-lai"},
+		{"xe buyt", "di-lai"}, {"gui xe", "di-lai"}, {"ve xe", "di-lai"},
+		{"di lai", "di-lai"}, {"tau ", "di-lai"}, {"may bay", "di-lai"},
+		{"hoa don", "hoa-don"}, {"tien dien", "hoa-don"}, {"tien nuoc", "hoa-don"},
+		{"internet", "hoa-don"}, {"wifi", "hoa-don"}, {"dien thoai", "hoa-don"},
+		{"shopee", "mua-sam"}, {"lazada", "mua-sam"}, {"mua sam", "mua-sam"},
+		{"quanao", "mua-sam"}, {" ao ", "mua-sam"}, {"quan ", "mua-sam"},
+		{"thuoc", "suc-khoe"}, {"benh vien", "suc-khoe"}, {"kham ", "suc-khoe"},
+		{"phim", "giai-tri"}, {"game", "giai-tri"}, {"karaoke", "giai-tri"},
+		{"sach", "giao-duc"}, {"hoc phi", "giao-duc"}, {"khoa hoc", "giao-duc"},
+		{"tien nha", "nha-o"}, {"thue nha", "nha-o"},
+		{"luong", "thu-nhap"}, {"thuong", "thu-nhap"},
+	}
+	for _, r := range rules {
+		if strings.Contains(padded, r.substr) {
+			return r.category
+		}
+	}
+	return ""
 }

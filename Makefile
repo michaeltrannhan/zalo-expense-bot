@@ -54,12 +54,12 @@ test: ## Unit tests
 
 test-integration: up ## Tests that need a real PostgreSQL (isolated zl_expense_test DB)
 	@until docker compose exec -T postgres pg_isready -U postgres -d zl_expense >/dev/null 2>&1; do sleep 0.5; done
-	@sh scripts/ensure-test-db.sh
+	@sh scripts/ensure-db.sh zl_expense_test
 	TEST_DATABASE_URL="postgres://postgres:$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/zl_expense_test?sslmode=disable" go test -p 1 -count=1 -tags integration ./...
 
 race: up ## Race-enabled integration run (isolated zl_expense_test DB)
 	@until docker compose exec -T postgres pg_isready -U postgres -d zl_expense >/dev/null 2>&1; do sleep 0.5; done
-	@sh scripts/ensure-test-db.sh
+	@sh scripts/ensure-db.sh zl_expense_test
 	TEST_DATABASE_URL="postgres://postgres:$(POSTGRES_PASSWORD)@localhost:$(POSTGRES_PORT)/zl_expense_test?sslmode=disable" go test -p 1 -race -count=1 -tags integration ./...
 
 vet:
@@ -75,7 +75,7 @@ simulate: migrate ## End-to-end local demo (no Zalo, no cloud)
 
 playground: up ## Browser chat + settings lab (local mock OCR, no Zalo/cloud)
 	@until docker compose exec -T postgres pg_isready -U postgres -d zl_expense >/dev/null 2>&1; do sleep 0.5; done
-	@sh scripts/ensure-playground-db.sh
+	@sh scripts/ensure-db.sh zl_expense_playground
 	@echo "Local playground: http://$(PLAYGROUND_ADDR)"
 	APP_ENV=development DATABASE_URL="$(PLAYGROUND_DATABASE_URL)" ZALO_WEBHOOK_SECRET=dev-secret-change-me \
 		ZALO_BOT_TOKEN= OBJECTSTORE=local DATA_DIR=./data EXTRACTOR=mock PILOT_ALLOWLIST= \

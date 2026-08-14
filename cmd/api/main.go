@@ -24,11 +24,12 @@ import (
 	"zl-expese-bot/internal/bot"
 	"zl-expese-bot/internal/categorisation"
 	"zl-expese-bot/internal/config"
+	"zl-expese-bot/internal/conversation"
 	"zl-expese-bot/internal/domain"
 	"zl-expese-bot/internal/insight"
 	"zl-expese-bot/internal/logging"
 	"zl-expese-bot/internal/messaging"
-	"zl-expese-bot/internal/messaging/logprovider"
+	_ "zl-expese-bot/internal/messaging/logprovider"
 	"zl-expese-bot/internal/messaging/zalo"
 	"zl-expese-bot/internal/notify"
 	"zl-expese-bot/internal/platform/clock"
@@ -70,15 +71,17 @@ func run() error {
 	st := store.New(pool)
 	clk := clock.Real{}
 	q := queue.NewPG(pool, clk)
-	objects, err := objectStore(ctx, cfg)
+	objects, err := objectstore.NewFromConfig(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	provider := messagingProvider(cfg, log)
+	provider := messaging.NewFromConfig(cfg, log)
 	replies := notify.NewEnqueuer(st, q, clk)
 	cats := categorisation.NewService(st, clk)
-	insights := insight.NewService(pool, clk)
-	handler := bot.NewHandler(st, pool, q, objects, replies, cats, insights, clk, log, cfg)
+	insights := insight.NewService(st)
+	handler := bot.NewHandler(st, q, objects, replies, cats, insights, clk, log, cfg)
+
+	registerZaloSlashMenu(ctx, log, provider)
 
 	if *poll {
 		client, ok := provider.(*zalo.Client)
@@ -98,29 +101,6 @@ func run() error {
 	return serve(ctx, log, cfg, pool, provider, handler)
 }
 
-// messagingProvider picks the messaging adapter: the real Zalo Bot API when
-// a token is configured, otherwise the log provider that never dials out.
-func messagingProvider(cfg config.Config, log *slog.Logger) messaging.Provider {
-	if cfg.MessagingMode() == "zalo" {
-		return zalo.New(zalo.Config{
-			Token:         cfg.ZaloBotToken,
-			WebhookSecret: cfg.ZaloWebhookSecret,
-			APIBase:       cfg.ZaloAPIBase,
-		})
-	}
-	log.Warn("ZALO_BOT_TOKEN not set: outbound messages are logged, not sent")
-	return logprovider.New(log)
-}
-
-// objectStore builds the receipt object store: local filesystem by default,
-// S3 (or S3-compatible such as Cloudflare R2) when OBJECTSTORE=s3.
-func objectStore(ctx context.Context, cfg config.Config) (objectstore.Store, error) {
-	if cfg.ObjectStoreBackend != "s3" {
-		return objectstore.NewLocal(cfg.DataDir)
-	}
-	return objectstore.ConnectS3(ctx, cfg.S3Bucket, cfg.S3Prefix, cfg.S3Endpoint, cfg.S3Region)
-}
-
 // serve runs the webhook HTTP server until ctx is cancelled, then shuts
 // down gracefully so in-flight requests finish.
 func serve(ctx context.Context, log *slog.Logger, cfg config.Config, pool *pgxpool.Pool, provider messaging.Provider, handler *bot.Handler) error {
@@ -130,6 +110,32 @@ func serve(ctx context.Context, log *slog.Logger, cfg config.Config, pool *pgxpo
 	mux.HandleFunc("POST /webhook/zalo", s.webhook)
 	mux.HandleFunc("GET /healthz", s.healthz)
 	return listenHTTP(ctx, log, cfg, mux)
+}
+
+// registerZaloSlashMenu pushes the compact English command list to Zalo's
+// "/" picker via setMyCommands. Fail-open: a missing method or network
+// error must not block webhook/poll handling. /xinchao is the platform
+// default and is replaced when the API accepts the new list.
+func registerZaloSlashMenu(ctx context.Context, log *slog.Logger, provider messaging.Provider) {
+	client, ok := provider.(*zalo.Client)
+	if !ok {
+		return
+	}
+	go func() {
+		regCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		menu := conversation.SlashMenu()
+		cmds := make([]zalo.Command, 0, len(menu))
+		for _, c := range menu {
+			cmds = append(cmds, zalo.Command{Command: c.Command, Description: c.Description})
+		}
+		if err := client.SetMyCommands(regCtx, cmds); err != nil {
+			log.Warn("zalo setMyCommands failed; / picker may still show /xinchao",
+				slog.String("error", err.Error()))
+			return
+		}
+		log.Info("registered zalo slash commands", slog.Int("n", len(cmds)))
+	}()
 }
 
 // serveHealthz binds LISTEN_ADDR with only GET /healthz. Used in -poll so

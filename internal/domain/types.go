@@ -46,6 +46,20 @@ type User struct {
 	DeletedAt       *time.Time
 }
 
+// Location returns the user's IANA timezone, or UTC if the stored name is
+// missing or invalid. Insight summaries must not use this: they error on a
+// bad timezone so a corrupt setting cannot silently shift period bounds.
+func (u User) Location() *time.Location {
+	if u.Timezone == "" {
+		return time.UTC
+	}
+	loc, err := time.LoadLocation(u.Timezone)
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}
+
 // UserIdentity maps a provider-issued subject onto a local user. Identity is
 // always the provider sender ID, never a display name.
 type UserIdentity struct {

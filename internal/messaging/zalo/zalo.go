@@ -132,6 +132,65 @@ func (c *Client) GetMe(ctx context.Context) (BotInfo, error) {
 	return info, nil
 }
 
+// Command is one slash-menu entry (no leading slash), matching the
+// Telegram-shaped Zalo Bot API setMyCommands payload.
+type Command struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
+// SetMyCommands replaces the bot's "/" picker list via
+// POST /bot{token}/setMyCommands. Zalo's Bot API is Telegram-compatible for
+// this method; a successful call replaces the platform default /xinchao.
+// Command names must be 1–32 lowercase letters, digits or underscores.
+func (c *Client) SetMyCommands(ctx context.Context, commands []Command) error {
+	if c.token == "" {
+		return domain.E(domain.CodeValidation, "zalo bot token not configured", nil)
+	}
+	if len(commands) == 0 {
+		return domain.E(domain.CodeValidation, "setMyCommands requires at least one command", nil)
+	}
+	payload, err := json.Marshal(map[string]any{"commands": commands})
+	if err != nil {
+		return domain.E(domain.CodeValidation, "encode setMyCommands body", err)
+	}
+	ctx, cancel := context.WithTimeout(ctx, sendTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.base+"/bot"+c.token+"/setMyCommands", bytes.NewReader(payload))
+	if err != nil {
+		return domain.E(domain.CodeValidation, "build setMyCommands request", c.safeCause(err))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return domain.E(domain.CodeTransient, "setMyCommands request failed", c.safeCause(err))
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return domain.E(domain.CodeTransient, "read setMyCommands response", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return c.classifyStatus(resp.StatusCode, body)
+	}
+	var out struct {
+		OK          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return domain.E(domain.CodeTransient, "decode setMyCommands response", err)
+	}
+	if !out.OK {
+		description := c.redact(strings.TrimSpace(out.Description))
+		if description == "" {
+			description = "provider returned ok=false"
+		}
+		return domain.E(domain.CodeValidation, "setMyCommands rejected: "+description, nil)
+	}
+	return nil
+}
+
 // VerifyWebhook authenticates the inbound call by constant-time comparison
 // of the shared secret header. The body is never touched.
 func (c *Client) VerifyWebhook(_ context.Context, headers http.Header, _ []byte) error {

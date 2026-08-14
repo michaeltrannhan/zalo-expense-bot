@@ -23,24 +23,45 @@ func TestParse(t *testing.T) {
 		{"empty", "", IntentNone, "", "", 0, ""},
 		{"whitespace only", "   \n\t ", IntentNone, "", "", 0, ""},
 
-		// Slash commands (folded, diacritics-insensitive).
-		{"start", "/batdau", IntentStart, "", "", 0, ""},
-		{"today cmd", "/homnay", IntentToday, "", "", 0, ""},
+		// Slash commands (folded, diacritics-insensitive). English/abbrev
+		// is primary; Vietnamese names remain aliases.
+		{"start", "/start", IntentStart, "", "", 0, ""},
+		{"start vn alias", "/batdau", IntentStart, "", "", 0, ""},
+		{"xinchao leftover", "/xinchao", IntentStart, "", "", 0, ""},
+		{"today cmd", "/today", IntentToday, "", "", 0, ""},
+		{"today vn alias", "/homnay", IntentToday, "", "", 0, ""},
 		{"today cmd diacritics", "/hômnay", IntentToday, "", "", 0, ""},
 		{"today cmd noisy", " /HomNay! ", IntentToday, "", "", 0, ""},
-		{"week cmd", "/tuan", IntentWeek, "", "", 0, ""},
-		{"month cmd", "/thang", IntentMonth, "", "", 0, ""},
-		{"recent cmd", "/ganday", IntentRecent, "", "", 0, ""},
-		{"budget cmd", "/ngansach", IntentBudget, "", "", 0, ""},
-		{"export cmd", "/xuatdulieu", IntentExport, "", "", 0, ""},
-		{"delete cmd", "/xoadulieu", IntentDeleteData, "", "", 0, ""},
-		{"settings cmd", "/caidat", IntentSettings, "", "", 0, ""},
+		{"week cmd", "/week", IntentWeek, "", "", 0, ""},
+		{"week vn alias", "/tuan", IntentWeek, "", "", 0, ""},
+		{"month cmd", "/month", IntentMonth, "", "", 0, ""},
+		{"month vn alias", "/thang", IntentMonth, "", "", 0, ""},
+		{"recent cmd", "/recent", IntentRecent, "", "", 0, ""},
+		{"recent vn alias", "/ganday", IntentRecent, "", "", 0, ""},
+		{"budget cmd", "/budget", IntentBudget, "", "", 0, ""},
+		{"budget vn alias", "/ngansach", IntentBudget, "", "", 0, ""},
+		{"export cmd", "/export", IntentExport, "", "", 0, ""},
+		{"export vn alias", "/xuatdulieu", IntentExport, "", "", 0, ""},
+		{"delete cmd", "/delete", IntentDeleteData, "", "", 0, ""},
+		{"wipe cmd", "/wipe", IntentDeleteData, "", "", 0, ""},
+		{"delete vn alias", "/xoadulieu", IntentDeleteData, "", "", 0, ""},
+		{"settings cmd", "/settings", IntentSettings, "", "", 0, ""},
+		{"settings vn alias", "/caidat", IntentSettings, "", "", 0, ""},
 		{"settings cmd diacritics", "/càiđặt", IntentSettings, "", "", 0, ""},
-		{"help cmd", "/trogiup", IntentHelp, "", "", 0, ""},
+		{"help cmd", "/help", IntentHelp, "", "", 0, ""},
+		{"help vn alias", "/trogiup", IntentHelp, "", "", 0, ""},
+		{"privacy cmd", "/privacy", IntentPrivacy, "", "", 0, ""},
+		{"consent cmd", "/consent", IntentPrivacy, "", "", 0, ""},
+		{"confirm slash", "/ok", IntentConfirm, "", "", 0, ""},
+		{"discard slash", "/n", IntentDiscard, "", "", 0, ""},
+		{"edit slash", "/edit", IntentEditTotal, "", "", 0, ""},
 		{"unknown cmd", "/kholai", IntentNone, "", "", 0, ""},
+		{"bare today", "today", IntentToday, "", "", 0, ""},
 
 		// Edit phrases (exact folded match).
 		{"edit total", "sua so tien", IntentEditTotal, "", "", 0, ""},
+		{"edit english", "edit", IntentEditTotal, "", "", 0, ""},
+		{"fix english", "fix", IntentEditTotal, "", "", 0, ""},
 		{"edit total diacritics", "sửa số tiền", IntentEditTotal, "", "", 0, ""},
 		{"edit total wrong", "sai so tien", IntentEditTotal, "", "", 0, ""},
 		{"edit total change", "đổi số tiền", IntentEditTotal, "", "", 0, ""},
@@ -92,12 +113,15 @@ func TestParse(t *testing.T) {
 		{"confirm co", "có", IntentConfirm, "", "", 0, ""},
 		{"confirm co not bare", "có gì không", IntentNone, "", "", 0, ""},
 		{"confirm yes", "yes", IntentConfirm, "", "", 0, ""},
+		{"confirm y", "y", IntentConfirm, "", "", 0, ""},
 
 		// Discard (exact).
 		{"discard bo qua", "bỏ qua", IntentDiscard, "", "", 0, ""},
 		{"discard huy", "huỷ", IntentDiscard, "", "", 0, ""},
 		{"discard khong", "không", IntentDiscard, "", "", 0, ""},
 		{"discard skip", "skip", IntentDiscard, "", "", 0, ""},
+		{"discard no", "no", IntentDiscard, "", "", 0, ""},
+		{"discard n", "n", IntentDiscard, "", "", 0, ""},
 		{"discard thoi", "thôi", IntentDiscard, "", "", 0, ""},
 		{"discard khong not bare", "không phải vậy", IntentNone, "", "", 0, ""},
 
@@ -123,6 +147,12 @@ func TestParse(t *testing.T) {
 		{"manual usd", "$50 lunch meeting", IntentManualEntry, "", "lunch meeting", 5000, "USD"},
 		{"manual no desc", "150000", IntentNone, "", "", 0, ""},
 		{"manual bad amount", "abc ăn trưa", IntentNone, "", "", 0, ""},
+		{"manual trailing breakfast", "an sang 500k", IntentManualEntry, "", "an sang", 500000, "VND"},
+		{"manual trailing cafe", "cafe 45k", IntentManualEntry, "", "cafe", 45000, "VND"},
+		{"manual trailing dotted", "com 80.000", IntentManualEntry, "", "com", 80000, "VND"},
+		{"manual diacritics breakfast", "ăn sáng 500k", IntentManualEntry, "", "ăn sáng", 500000, "VND"},
+		{"command not expense", "/today", IntentToday, "", "", 0, ""},
+		{"confirm not expense", "ok", IntentConfirm, "", "", 0, ""},
 
 		// Garbage / precedence.
 		{"garbage", "blah blah blah", IntentNone, "", "", 0, ""},
@@ -165,10 +195,14 @@ func TestParseSettings(t *testing.T) {
 		timezone string
 		currency string
 	}{
+		{"/settings", SettingsShow, "", ""},
 		{"/caidat", SettingsShow, "", ""},
 		{"/càiđặt múi giờ Asia/Ho_Chi_Minh", SettingsSetTimezone, "Asia/Ho_Chi_Minh", ""},
+		{"/tz Asia/Ho_Chi_Minh", SettingsSetTimezone, "Asia/Ho_Chi_Minh", ""},
 		{"/caidat muigio UTC", SettingsSetTimezone, "UTC", ""},
+		{"/settings tz UTC", SettingsSetTimezone, "UTC", ""},
 		{"/caidat tiền tệ usd", SettingsSetCurrency, "", "USD"},
+		{"/settings currency AUD", SettingsSetCurrency, "", "AUD"},
 		{"/caidat tiente AUD", SettingsSetCurrency, "", "AUD"},
 		{"/caidat muigio", SettingsInvalid, "", ""},
 		{"/caidat unknown value", SettingsInvalid, "", ""},
@@ -201,11 +235,15 @@ func TestParseSummarySchedule(t *testing.T) {
 		minute     int
 		disableAll bool
 	}{
+		{"/sched", SummaryScheduleShow, "", 0, false},
 		{"/tongket", SummaryScheduleShow, "", 0, false},
 		{"/tongket ngày 20:05", SummaryScheduleSet, domain.SummaryDaily, 20*60 + 5, false},
+		{"/sched daily 20:05", SummaryScheduleSet, domain.SummaryDaily, 20*60 + 5, false},
 		{"bật tổng kết tuần 08:30", SummaryScheduleSet, domain.SummaryWeekly, 8*60 + 30, false},
 		{"/tongket thang 09:00", SummaryScheduleSet, domain.SummaryMonthly, 9 * 60, false},
+		{"/sched weekly 08:00", SummaryScheduleSet, domain.SummaryWeekly, 8 * 60, false},
 		{"tắt tổng kết ngày", SummaryScheduleDisable, domain.SummaryDaily, 0, false},
+		{"/sched off", SummaryScheduleDisable, "", 0, true},
 		{"/tongket tat ca", SummaryScheduleDisable, "", 0, true},
 		{"/tongket ngay 25:00", SummaryScheduleInvalid, "", 0, false},
 		{"/tongket ngay", SummaryScheduleInvalid, "", 0, false},
@@ -227,7 +265,7 @@ func TestParseSummarySchedule(t *testing.T) {
 func TestTemplateSmoke(t *testing.T) {
 	funcs := map[string]string{
 		"ConsentCard": ConsentCard(),
-		"PrivacyText": PrivacyText(),
+		"PrivacyText": PrivacyText(30, "mock"),
 		"WelcomeText": WelcomeText(),
 		"HelpText":    HelpText(),
 		"SettingsText": SettingsText(domain.User{
@@ -286,6 +324,25 @@ func TestTemplateSmoke(t *testing.T) {
 	}
 }
 
+func TestPrivacyText(t *testing.T) {
+	mockCopy := PrivacyText(14, "mock")
+	if !strings.Contains(mockCopy, "xóa sau 14 ngày") {
+		t.Errorf("mock privacy missing retention days:\n%s", mockCopy)
+	}
+	if !strings.Contains(mockCopy, "không chia sẻ dữ liệu của bạn cho bên thứ ba") {
+		t.Errorf("mock privacy should claim no third parties:\n%s", mockCopy)
+	}
+	for _, extractor := range []string{"gemini", "textract"} {
+		got := PrivacyText(7, extractor)
+		if !strings.Contains(got, "xóa sau 7 ngày") {
+			t.Errorf("%s privacy missing retention days:\n%s", extractor, got)
+		}
+		if strings.Contains(got, "không chia sẻ dữ liệu của bạn cho bên thứ ba") {
+			t.Errorf("%s privacy must not claim no third parties:\n%s", extractor, got)
+		}
+	}
+}
+
 func TestEditPromptExact(t *testing.T) {
 	if got := EditPrompt(domain.PendingEditTotal); got != "Nhập số tiền đúng (ví dụ: 325000):" {
 		t.Errorf("EditPrompt(edit_total) = %q", got)
@@ -319,8 +376,8 @@ func TestExtractionCard(t *testing.T) {
 		"Ngày: 19/07/2026",
 		"Loại: Chi tiêu",
 		"Danh mục: Thực phẩm",
-		"'xác nhận' để lưu",
-		"'bỏ qua' để hủy",
+		"ok / y để lưu",
+		"no / n để hủy",
 	} {
 		if !strings.Contains(card, want) {
 			t.Errorf("ExtractionCard missing %q:\n%s", want, card)
@@ -444,6 +501,46 @@ func TestRecentText(t *testing.T) {
 	}
 }
 
+func TestHelpTextUsesShortCommands(t *testing.T) {
+	got := HelpText()
+	for _, want := range []string{"/help", "/today", "/week", "/month", "/recent", "/settings", "/sched", "/export", "/delete", "/privacy", "an sang 500k"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("HelpText missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "/trogiup") || strings.Contains(got, "/xoadulieu") {
+		t.Errorf("HelpText still advertises long VN slash commands as primary:\n%s", got)
+	}
+}
+
+func TestSlashMenu(t *testing.T) {
+	cmds := SlashMenu()
+	if len(cmds) == 0 {
+		t.Fatal("SlashMenu empty")
+	}
+	seen := map[string]bool{}
+	for _, c := range cmds {
+		if c.Command == "" || strings.HasPrefix(c.Command, "/") {
+			t.Errorf("command %q must be non-empty without a leading slash", c.Command)
+		}
+		if c.Description == "" {
+			t.Errorf("%s missing description", c.Command)
+		}
+		if seen[c.Command] {
+			t.Errorf("duplicate command %q", c.Command)
+		}
+		seen[c.Command] = true
+	}
+	for _, want := range []string{"help", "today", "week", "month", "recent", "settings", "sched", "export", "delete", "privacy"} {
+		if !seen[want] {
+			t.Errorf("SlashMenu missing %q", want)
+		}
+	}
+	if seen["xinchao"] {
+		t.Error("SlashMenu must not keep the Zalo default xinchao")
+	}
+}
+
 func TestDateVN(t *testing.T) {
 	loc := time.FixedZone("ICT", 7*3600)
 	// 23:30 UTC is already the next day in +7.
@@ -496,7 +593,7 @@ func TestTypeListText(t *testing.T) {
 
 func TestDeleteConfirmText(t *testing.T) {
 	got := DeleteConfirmText()
-	for _, want := range []string{"giao dịch", "Ảnh hóa đơn", "quy tắc", "xác nhận"} {
+	for _, want := range []string{"giao dịch", "Ảnh hóa đơn", "quy tắc", "ok"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("DeleteConfirmText missing %q:\n%s", want, got)
 		}
@@ -510,7 +607,7 @@ func TestPossibleDuplicateText(t *testing.T) {
 	})
 	for _, want := range []string{
 		"có thể trùng", "325.000 ₫ · Co.opmart · 15/07/2026",
-		"CO.OPMART NGUYỄN TRÃI", "xác nhận", "bỏ qua",
+		"CO.OPMART NGUYỄN TRÃI", "ok", "no",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("PossibleDuplicateText missing %q:\n%s", want, got)

@@ -14,6 +14,7 @@ import (
 
 	"zl-expese-bot/contracts/events"
 	"zl-expese-bot/internal/account"
+	"zl-expese-bot/internal/categorisation"
 	"zl-expese-bot/internal/conversation"
 	"zl-expese-bot/internal/domain"
 	"zl-expese-bot/internal/extraction/normalise"
@@ -102,8 +103,8 @@ func (h *Handler) handleImage(ctx context.Context, user *domain.User, ev events.
 	return h.reply(ctx, user.ID, ev, conversation.ReceiptReceivedText(), "ack:"+pm.ID.String())
 }
 
-// summary answers the period commands (/homnay, /tuan, /thang, /tuantruoc,
-// /thangtruoc) with deterministic SQL aggregates, and records the generated
+// summary answers the period commands (/today, /week, /month, /lastweek,
+// /lastmonth) with deterministic SQL aggregates, and records the generated
 // summary as an evidence-backed insight row (P4-B02). A persistence failure
 // is logged but never blocks the user's answer.
 func (h *Handler) summary(ctx context.Context, user *domain.User, ev events.InboundEvent, pm *domain.ProviderMessage, kind periodKind) error {
@@ -264,7 +265,7 @@ func validCurrencyCode(currency string) bool {
 	return true
 }
 
-// recent answers /ganday with the newest transactions.
+// recent answers /recent with the newest transactions.
 func (h *Handler) recent(ctx context.Context, user *domain.User, ev events.InboundEvent, pm *domain.ProviderMessage) error {
 	txs, err := h.st.ListRecentTransactions(ctx, user.ID, 10)
 	if err != nil {
@@ -310,7 +311,7 @@ func (h *Handler) export(ctx context.Context, user *domain.User, ev events.Inbou
 	if err != nil {
 		return domain.E(domain.CodeInternal, "create csv export", err)
 	}
-	n, csvErr := account.ExportTransactionsCSV(ctx, h.pool, user.ID, csvFile)
+	n, csvErr := account.ExportTransactionsCSV(ctx, h.st, user.ID, csvFile)
 	if cerr := csvFile.Close(); cerr != nil && csvErr == nil {
 		csvErr = cerr
 	}
@@ -322,7 +323,7 @@ func (h *Handler) export(ctx context.Context, user *domain.User, ev events.Inbou
 	if err != nil {
 		return domain.E(domain.CodeInternal, "create json export", err)
 	}
-	jsonErr := account.ExportMetadataJSON(ctx, h.pool, user.ID, jsonFile)
+	jsonErr := account.ExportMetadataJSON(ctx, h.st, user.ID, jsonFile)
 	if cerr := jsonFile.Close(); cerr != nil && jsonErr == nil {
 		jsonErr = cerr
 	}
@@ -346,7 +347,7 @@ func (h *Handler) requestDelete(ctx context.Context, user *domain.User, ev event
 
 // deleteAccount runs the full deletion flow through internal/account.
 func (h *Handler) deleteAccount(ctx context.Context, userID, providerMessageID uuid.UUID) (account.Report, error) {
-	return account.DeleteAccount(ctx, h.pool, h.objects, h.cfg.DataDir, userID, providerMessageID)
+	return account.DeleteAccount(ctx, h.st, h.objects, h.cfg.DataDir, userID, providerMessageID)
 }
 
 // requestDeleteRecent arms the two-step individual deletion (P4-D02): the
@@ -387,7 +388,7 @@ func (h *Handler) manualEntry(ctx context.Context, user *domain.User, ev events.
 		}
 		merchant = m
 	}
-	sug, err := h.cats.SuggestCategory(ctx, user.ID, merchant, guessCategoryKey(intent.Description), 0.6)
+	sug, err := h.cats.SuggestCategory(ctx, user.ID, merchant, categorisation.GuessCategoryKey(intent.Description), 0.6)
 	if err != nil {
 		return err
 	}
@@ -476,41 +477,4 @@ func (h *Handler) recategorise(ctx context.Context, user *domain.User, ev events
 		h.log.Warn("learn from recategorise failed", slog.Any("error", err))
 	}
 	return h.reply(ctx, user.ID, ev, conversation.RecategorisedText(tx.MerchantName, cat.DisplayName), "cmd:"+ev.ProviderMessageID)
-}
-
-// guessCategoryKey is the deterministic keyword fallback for manual entries;
-// user rules and corrections override it after one confirmation.
-func guessCategoryKey(desc string) string {
-	_, key := normalise.NormaliseMerchant(desc)
-	if key == "" {
-		return ""
-	}
-	padded := " " + key + " "
-	type rule struct{ substr, category string }
-	rules := []rule{
-		{"ca phe", "an-uong"}, {"cafe", "an-uong"}, {"tra sua", "an-uong"},
-		{"an sang", "an-uong"}, {"an trua", "an-uong"}, {"an toi", "an-uong"},
-		{" an ", "an-uong"}, {"com ", "an-uong"}, {"pho ", "an-uong"},
-		{"bun ", "an-uong"}, {"do an", "an-uong"}, {"nuoc uong", "an-uong"},
-		{" cho ", "thuc-pham"}, {"sieu thi", "thuc-pham"}, {"tap hoa", "thuc-pham"},
-		{"rau ", "thuc-pham"}, {"thit ", "thuc-pham"},
-		{"grab", "di-lai"}, {"taxi", "di-lai"}, {"xang", "di-lai"},
-		{"xe buyt", "di-lai"}, {"gui xe", "di-lai"}, {"ve xe", "di-lai"},
-		{"di lai", "di-lai"}, {"tau ", "di-lai"}, {"may bay", "di-lai"},
-		{"hoa don", "hoa-don"}, {"tien dien", "hoa-don"}, {"tien nuoc", "hoa-don"},
-		{"internet", "hoa-don"}, {"wifi", "hoa-don"}, {"dien thoai", "hoa-don"},
-		{"shopee", "mua-sam"}, {"lazada", "mua-sam"}, {"mua sam", "mua-sam"},
-		{"quanao", "mua-sam"}, {" ao ", "mua-sam"}, {"quan ", "mua-sam"},
-		{"thuoc", "suc-khoe"}, {"benh vien", "suc-khoe"}, {"kham ", "suc-khoe"},
-		{"phim", "giai-tri"}, {"game", "giai-tri"}, {"karaoke", "giai-tri"},
-		{"sach", "giao-duc"}, {"hoc phi", "giao-duc"}, {"khoa hoc", "giao-duc"},
-		{"tien nha", "nha-o"}, {"thue nha", "nha-o"},
-		{"luong", "thu-nhap"}, {"thuong", "thu-nhap"},
-	}
-	for _, r := range rules {
-		if strings.Contains(padded, r.substr) {
-			return r.category
-		}
-	}
-	return ""
 }

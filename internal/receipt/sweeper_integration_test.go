@@ -45,10 +45,11 @@ func TestRetentionSweep(t *testing.T) {
 	past := time.Now().Add(-time.Hour)
 	future := time.Now().Add(24 * time.Hour)
 
-	// Expired receipt with a stored object.
+	// Expired confirmed receipt with a stored object.
 	expired := uuid.New()
 	if err := st.CreateReceipt(ctx, &domain.ReceiptDocument{
-		ID: expired, UserID: userID, RetentionPolicy: "originals_30d", DeleteAfter: &past,
+		ID: expired, UserID: userID, Status: domain.ReceiptConfirmed,
+		RetentionPolicy: "originals_30d", DeleteAfter: &past,
 	}); err != nil {
 		t.Fatalf("create expired receipt: %v", err)
 	}
@@ -60,12 +61,22 @@ func TestRetentionSweep(t *testing.T) {
 		t.Fatalf("set stored: %v", err)
 	}
 
-	// Expired receipt without an object (never stored).
+	// Expired confirmed receipt without an object (never stored).
 	expiredNoObj := uuid.New()
 	if err := st.CreateReceipt(ctx, &domain.ReceiptDocument{
-		ID: expiredNoObj, UserID: userID, RetentionPolicy: "originals_30d", DeleteAfter: &past,
+		ID: expiredNoObj, UserID: userID, Status: domain.ReceiptConfirmed,
+		RetentionPolicy: "originals_30d", DeleteAfter: &past,
 	}); err != nil {
 		t.Fatalf("create objectless receipt: %v", err)
+	}
+
+	// In-flight queued receipt past delete_after must keep its original.
+	inFlight := uuid.New()
+	if err := st.CreateReceipt(ctx, &domain.ReceiptDocument{
+		ID: inFlight, UserID: userID, Status: domain.ReceiptQueued,
+		RetentionPolicy: "originals_30d", DeleteAfter: &past,
+	}); err != nil {
+		t.Fatalf("create in-flight receipt: %v", err)
 	}
 
 	// Fresh receipt: must survive the sweep.
@@ -129,6 +140,13 @@ func TestRetentionSweep(t *testing.T) {
 	}
 	if got.Status == domain.ReceiptDeleted {
 		t.Errorf("fresh receipt was deleted; retention deadline must be respected")
+	}
+	got, err = st.GetReceipt(ctx, inFlight)
+	if err != nil {
+		t.Fatalf("load in-flight receipt: %v", err)
+	}
+	if got.Status != domain.ReceiptQueued {
+		t.Errorf("in-flight receipt status = %s, want queued", got.Status)
 	}
 	var expiredCount, freshCount int
 	if err := pool.QueryRow(ctx,

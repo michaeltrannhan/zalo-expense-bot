@@ -291,3 +291,13 @@ func FuzzParseDate(f *testing.F) {
 		}
 	})
 }
+
+func TestFold(t *testing.T) {
+	t.Parallel()
+	if got, want := Fold("  Tuần  Này  "), "tuan nay"; got != want {
+		t.Errorf("Fold whitespace+diacritics = %q, want %q", got, want)
+	}
+	if got, want := Fold("ĐỔI"), "doi"; got != want {
+		t.Errorf("Fold uppercase = %q, want %q", got, want)
+	}
+}

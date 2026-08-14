@@ -3,15 +3,12 @@ package insight
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zl-expese-bot/internal/domain"
-	"zl-expese-bot/internal/platform/clock"
+	"zl-expese-bot/internal/store"
 )
 
 const (
@@ -73,13 +70,12 @@ type Summary struct {
 
 // Service computes and persists insight summaries.
 type Service struct {
-	pool  *pgxpool.Pool
-	clock clock.Clock
+	st *store.Store
 }
 
-// NewService builds a Service on pool; clk timestamps generated rows.
-func NewService(pool *pgxpool.Pool, clk clock.Clock) *Service {
-	return &Service{pool: pool, clock: clk}
+// NewService builds a Service on st.
+func NewService(st *store.Store) *Service {
+	return &Service{st: st}
 }
 
 // Persist stores a generated summary as an evidence-backed insight row
@@ -92,7 +88,7 @@ func (s *Service) Persist(ctx context.Context, userID uuid.UUID, insightType str
 	if err != nil {
 		return domain.E(domain.CodeInternal, "marshal insight payload", err)
 	}
-	ids, err := s.evidenceIDs(ctx, userID, p)
+	ids, err := s.st.ListInsightEvidenceIDs(ctx, userID, p.Start, p.End)
 	if err != nil {
 		return err
 	}
@@ -104,21 +100,7 @@ func (s *Service) Persist(ctx context.Context, userID uuid.UUID, insightType str
 	if err != nil {
 		return domain.E(domain.CodeInternal, "marshal insight evidence", err)
 	}
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO insights (id, user_id, insight_type, period_start, period_end,
-		                      payload_json, evidence_json, generator_version)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (user_id, insight_type, period_start)
-		DO UPDATE SET period_end = EXCLUDED.period_end,
-		              payload_json = EXCLUDED.payload_json,
-		              evidence_json = EXCLUDED.evidence_json,
-		              generator_version = EXCLUDED.generator_version,
-		              created_at = now()`,
-		uuid.New(), userID, insightType, p.Start, p.End, payload, evidence, GeneratorVersion)
-	if err != nil {
-		return domain.E(domain.CodeTransient, "persist insight", err)
-	}
-	return nil
+	return s.st.UpsertInsight(ctx, userID, insightType, p.Start, p.End, payload, evidence, GeneratorVersion)
 }
 
 // Summarise aggregates the user's recorded transactions in [p.Start, p.End).
@@ -139,242 +121,69 @@ func (s *Service) Summarise(ctx context.Context, userID uuid.UUID, p Period) (Su
 		LargestByCurrency: []LargestTx{},
 	}
 
-	// One GROUP BY over the scoped set feeds the per-currency totals and
-	// the overall transaction count.
-	totals, err := s.pool.Query(ctx, `
-		SELECT type, currency, SUM(amount_minor)::bigint, COUNT(*)::int
-		FROM transactions
-		WHERE user_id = $1
-		  AND status IN ('confirmed','amended')
-		  AND deleted_at IS NULL
-		  AND occurred_at >= $2 AND occurred_at < $3
-		GROUP BY type, currency`, userID, p.Start, p.End)
+	totals, err := s.st.ListInsightPeriodTotals(ctx, userID, p.Start, p.End)
 	if err != nil {
-		return Summary{}, domain.E(domain.CodeTransient, "query summary totals", err)
+		return Summary{}, err
 	}
-	defer totals.Close()
-	for totals.Next() {
-		var txType, currency string
-		var minor int64
-		var count int
-		if err := totals.Scan(&txType, &currency, &minor, &count); err != nil {
-			return Summary{}, domain.E(domain.CodeTransient, "scan summary totals", err)
-		}
-		sum.TxCount += count
-		switch domain.TxType(txType) {
+	for _, row := range totals {
+		sum.TxCount += row.Count
+		switch domain.TxType(row.Type) {
 		case domain.TxExpense:
-			sum.CurrencyTotals[currency] = minor
+			sum.CurrencyTotals[row.Currency] = row.Minor
 		case domain.TxRefund:
-			sum.RefundTotals[currency] = minor
+			sum.RefundTotals[row.Currency] = row.Minor
 		}
-	}
-	if err := totals.Err(); err != nil {
-		return Summary{}, domain.E(domain.CodeTransient, "iterate summary totals", err)
 	}
 
-	if err := s.fillCategories(ctx, userID, p, &sum); err != nil {
+	cats, err := s.st.ListInsightCategoryTotals(ctx, userID, p.Start, p.End)
+	if err != nil {
 		return Summary{}, err
 	}
-	if err := s.fillMerchants(ctx, userID, p, &sum); err != nil {
+	for _, row := range cats {
+		sum.ByCategory = append(sum.ByCategory, CategoryTotal{
+			CategoryKey: row.CategoryKey, DisplayName: row.DisplayName,
+			Currency: row.Currency, Minor: row.Minor, Count: row.Count,
+		})
+	}
+
+	merchants, err := s.st.ListInsightMerchantTotals(ctx, userID, p.Start, p.End)
+	if err != nil {
 		return Summary{}, err
 	}
-	if err := s.fillLargest(ctx, userID, p, &sum); err != nil {
+	for _, row := range merchants {
+		sum.ByMerchant = append(sum.ByMerchant, MerchantTotal{
+			Name: row.Name, Currency: row.Currency, Minor: row.Minor, Count: row.Count,
+		})
+	}
+
+	largest, err := s.st.ListInsightLargestByCurrency(ctx, userID, p.Start, p.End)
+	if err != nil {
 		return Summary{}, err
 	}
-	if err := s.fillNoSpendDays(ctx, userID, p, loc, &sum); err != nil {
+	for _, row := range largest {
+		sum.LargestByCurrency = append(sum.LargestByCurrency, LargestTx{
+			Merchant: row.Merchant, Minor: row.Minor, Currency: row.Currency, OccurredAt: row.OccurredAt,
+		})
+	}
+
+	spendDays, err := s.st.CountInsightExpenseDays(ctx, userID, p.Start, p.End, loc.String())
+	if err != nil {
 		return Summary{}, err
 	}
+	sum.NoSpendDays = localDays(p, loc) - spendDays
 	return sum, nil
 }
 
-// Record persists sum as an insights row. The evidence transaction IDs are
-// re-selected from the same scope Summarise uses, so evidence always matches
-// the recorded transactions behind the numbers.
-func (s *Service) Record(ctx context.Context, userID uuid.UUID, insightType string, p Period, sum Summary) error {
-	if insightType == "" {
-		return domain.E(domain.CodeValidation, "insight type is required", nil)
-	}
-	if !p.End.After(p.Start) {
-		return domain.E(domain.CodeValidation, "period end must be after period start", nil)
-	}
-	ids, err := s.evidenceIDs(ctx, userID, p)
-	if err != nil {
-		return err
-	}
-	payload, err := json.Marshal(sum)
-	if err != nil {
-		return domain.E(domain.CodeInternal, "marshal insight payload", err)
-	}
-	evidence, err := json.Marshal(struct {
-		Method         string      `json:"method"`
-		TransactionIDs []uuid.UUID `json:"transaction_ids"`
-	}{Method: EvidenceMethod, TransactionIDs: ids})
-	if err != nil {
-		return domain.E(domain.CodeInternal, "marshal insight evidence", err)
-	}
-
-	_, err = s.pool.Exec(ctx, `
-		INSERT INTO insights (id, user_id, insight_type, period_start, period_end,
-			payload_json, evidence_json, generator_version, status, created_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ready', $9)`,
-		uuid.New(), userID, insightType, p.Start, p.End,
-		payload, evidence, GeneratorVersion, s.clock.Now().UTC())
-	if err != nil {
-		return domain.E(domain.CodeTransient, "insert insight", err)
-	}
-	return nil
-}
-
 func (s *Service) userLocation(ctx context.Context, userID uuid.UUID) (*time.Location, error) {
-	var tz string
-	err := s.pool.QueryRow(ctx, `SELECT timezone FROM users WHERE id = $1`, userID).Scan(&tz)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, domain.Ef(domain.CodeNotFound, nil, "user %s not found", userID)
-	}
+	u, err := s.st.GetUser(ctx, userID)
 	if err != nil {
-		return nil, domain.E(domain.CodeTransient, "load user timezone", err)
+		return nil, err
 	}
-	loc, err := time.LoadLocation(tz)
+	loc, err := time.LoadLocation(u.Timezone)
 	if err != nil {
-		return nil, domain.Ef(domain.CodeInternal, err, "invalid stored timezone %q", tz)
+		return nil, domain.Ef(domain.CodeInternal, err, "invalid stored timezone %q", u.Timezone)
 	}
 	return loc, nil
-}
-
-func (s *Service) fillCategories(ctx context.Context, userID uuid.UUID, p Period, sum *Summary) error {
-	// Grouped by (category, currency): never sum minor units across
-	// currencies. NULL categories fold into the 'khac' system bucket.
-	rows, err := s.pool.Query(ctx, `
-		SELECT COALESCE(c.system_key, 'khac'), COALESCE(c.display_name, 'Khác'),
-		       t.currency, SUM(t.amount_minor)::bigint, COUNT(*)::int
-		FROM transactions t
-		LEFT JOIN categories c ON c.id = t.category_id
-		WHERE t.user_id = $1
-		  AND t.status IN ('confirmed','amended')
-		  AND t.deleted_at IS NULL
-		  AND t.type = 'expense'
-		  AND t.occurred_at >= $2 AND t.occurred_at < $3
-		GROUP BY 1, 2, t.currency
-		ORDER BY t.currency, 4 DESC, 1 ASC`, userID, p.Start, p.End)
-	if err != nil {
-		return domain.E(domain.CodeTransient, "query category totals", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var ct CategoryTotal
-		if err := rows.Scan(&ct.CategoryKey, &ct.DisplayName, &ct.Currency, &ct.Minor, &ct.Count); err != nil {
-			return domain.E(domain.CodeTransient, "scan category total", err)
-		}
-		sum.ByCategory = append(sum.ByCategory, ct)
-	}
-	if err := rows.Err(); err != nil {
-		return domain.E(domain.CodeTransient, "iterate category totals", err)
-	}
-	return nil
-}
-
-func (s *Service) fillMerchants(ctx context.Context, userID uuid.UUID, p Period, sum *Summary) error {
-	rows, err := s.pool.Query(ctx, `
-		SELECT merchant_name, currency, SUM(amount_minor)::bigint, COUNT(*)::int
-		FROM transactions
-		WHERE user_id = $1
-		  AND status IN ('confirmed','amended')
-		  AND deleted_at IS NULL
-		  AND type = 'expense'
-		  AND occurred_at >= $2 AND occurred_at < $3
-		GROUP BY merchant_name, currency
-		ORDER BY currency, 3 DESC, 1 ASC`, userID, p.Start, p.End)
-	if err != nil {
-		return domain.E(domain.CodeTransient, "query merchant totals", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var mt MerchantTotal
-		if err := rows.Scan(&mt.Name, &mt.Currency, &mt.Minor, &mt.Count); err != nil {
-			return domain.E(domain.CodeTransient, "scan merchant total", err)
-		}
-		sum.ByMerchant = append(sum.ByMerchant, mt)
-	}
-	if err := rows.Err(); err != nil {
-		return domain.E(domain.CodeTransient, "iterate merchant totals", err)
-	}
-	return nil
-}
-
-func (s *Service) fillLargest(ctx context.Context, userID uuid.UUID, p Period, sum *Summary) error {
-	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT ON (currency)
-		       merchant_name, amount_minor, currency, occurred_at
-		FROM transactions
-		WHERE user_id = $1
-		  AND status IN ('confirmed','amended')
-		  AND deleted_at IS NULL
-		  AND type = 'expense'
-		  AND occurred_at >= $2 AND occurred_at < $3
-		ORDER BY currency, amount_minor DESC, occurred_at ASC, id ASC`,
-		userID, p.Start, p.End)
-	if err != nil {
-		return domain.E(domain.CodeTransient, "query largest transaction", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var largest LargestTx
-		if err := rows.Scan(&largest.Merchant, &largest.Minor, &largest.Currency, &largest.OccurredAt); err != nil {
-			return domain.E(domain.CodeTransient, "scan largest transaction", err)
-		}
-		largest.OccurredAt = largest.OccurredAt.UTC()
-		sum.LargestByCurrency = append(sum.LargestByCurrency, largest)
-	}
-	if err := rows.Err(); err != nil {
-		return domain.E(domain.CodeTransient, "iterate largest transactions", err)
-	}
-	return nil
-}
-
-func (s *Service) fillNoSpendDays(ctx context.Context, userID uuid.UUID, p Period, loc *time.Location, sum *Summary) error {
-	var spendDays int
-	err := s.pool.QueryRow(ctx, `
-		SELECT COUNT(DISTINCT (occurred_at AT TIME ZONE $4)::date)::int
-		FROM transactions
-		WHERE user_id = $1
-		  AND status IN ('confirmed','amended')
-		  AND deleted_at IS NULL
-		  AND type = 'expense'
-		  AND occurred_at >= $2 AND occurred_at < $3`,
-		userID, p.Start, p.End, loc.String()).Scan(&spendDays)
-	if err != nil {
-		return domain.E(domain.CodeTransient, "query spend days", err)
-	}
-	sum.NoSpendDays = localDays(p, loc) - spendDays
-	return nil
-}
-
-// evidenceIDs lists the in-scope transaction IDs in deterministic order.
-func (s *Service) evidenceIDs(ctx context.Context, userID uuid.UUID, p Period) ([]uuid.UUID, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id
-		FROM transactions
-		WHERE user_id = $1
-		  AND status IN ('confirmed','amended')
-		  AND deleted_at IS NULL
-		  AND occurred_at >= $2 AND occurred_at < $3
-		ORDER BY id ASC`, userID, p.Start, p.End)
-	if err != nil {
-		return nil, domain.E(domain.CodeTransient, "query evidence transactions", err)
-	}
-	defer rows.Close()
-	ids := []uuid.UUID{}
-	for rows.Next() {
-		var id uuid.UUID
-		if err := rows.Scan(&id); err != nil {
-			return nil, domain.E(domain.CodeTransient, "scan evidence transaction", err)
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, domain.E(domain.CodeTransient, "iterate evidence transactions", err)
-	}
-	return ids, nil
 }
 
 // localDays counts the calendar days the period covers in loc. Period

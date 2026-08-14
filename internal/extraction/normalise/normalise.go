@@ -302,6 +302,14 @@ func ParseDate(raw string, tz *time.Location) (time.Time, error) {
 // Merchants
 // ---------------------------------------------------------------------------
 
+// Fold lowercases, strips Vietnamese diacritics, and collapses whitespace.
+// Punctuation is left to the caller — command matching trims it separately
+// from merchant legal-form stripping.
+func Fold(s string) string {
+	s = foldDiacritics.Replace(strings.ToLower(strings.TrimSpace(s)))
+	return strings.Join(strings.Fields(s), " ")
+}
+
 // foldDiacritics maps Vietnamese letters to their ASCII base so keys compare
 // regardless of diacritics. Applied after lowercasing.
 var foldDiacritics = strings.NewReplacer(

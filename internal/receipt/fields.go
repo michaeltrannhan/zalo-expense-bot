@@ -1,8 +1,6 @@
 package receipt
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -16,12 +14,6 @@ import (
 	"zl-expese-bot/internal/domain"
 	"zl-expese-bot/internal/extraction/normalise"
 )
-
-// shaOf digests image bytes for the duplicate check and extractor input.
-func shaOf(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
-}
 
 func fieldRaw(res events.ExtractionResult, name string) string {
 	f, ok := res.Fields[name]

@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zl-expese-bot/contracts/events"
 	"zl-expese-bot/internal/categorisation"
@@ -47,7 +46,6 @@ var redactedPayload = []byte(`{"redacted":true}`)
 // Handler routes normalised inbound events.
 type Handler struct {
 	st       *store.Store
-	pool     *pgxpool.Pool
 	q        queue.Queue
 	objects  objectstore.Store
 	replies  *notify.Enqueuer
@@ -60,9 +58,9 @@ type Handler struct {
 
 // NewHandler wires the handler. cfg supplies the allowlist, data directory
 // and per-user receipt limit.
-func NewHandler(st *store.Store, pool *pgxpool.Pool, q queue.Queue, objects objectstore.Store, replies *notify.Enqueuer, cats *categorisation.Service, insights *insight.Service, clk clock.Clock, log *slog.Logger, cfg config.Config) *Handler {
+func NewHandler(st *store.Store, q queue.Queue, objects objectstore.Store, replies *notify.Enqueuer, cats *categorisation.Service, insights *insight.Service, clk clock.Clock, log *slog.Logger, cfg config.Config) *Handler {
 	return &Handler{
-		st: st, pool: pool, q: q, objects: objects, replies: replies,
+		st: st, q: q, objects: objects, replies: replies,
 		cats: cats, insights: insights, clk: clk, log: log, cfg: cfg,
 	}
 }
@@ -226,7 +224,7 @@ func (h *Handler) consentFlow(ctx context.Context, user *domain.User, ev events.
 			}
 			return h.reply(ctx, user.ID, ev, conversation.WelcomeText(), "welcome:"+ev.ProviderMessageID)
 		case conversation.IntentPrivacy:
-			return h.reply(ctx, user.ID, ev, conversation.PrivacyText(), "privacy:"+ev.ProviderMessageID)
+			return h.reply(ctx, user.ID, ev, conversation.PrivacyText(h.cfg.OriginalRetentionDays, h.cfg.ExtractionBackend), "privacy:"+ev.ProviderMessageID)
 		}
 	}
 	return h.reply(ctx, user.ID, ev, conversation.ConsentCard(), "consent:"+ev.ProviderMessageID)
@@ -239,8 +237,5 @@ func (h *Handler) reply(ctx context.Context, userID uuid.UUID, ev events.Inbound
 
 // loc returns the user's timezone, UTC on misconfiguration.
 func loc(user *domain.User) *time.Location {
-	if l, err := time.LoadLocation(user.Timezone); err == nil {
-		return l
-	}
-	return time.UTC
+	return user.Location()
 }

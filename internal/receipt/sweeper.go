@@ -62,9 +62,9 @@ func (s *Sweeper) Handle(ctx context.Context, job *domain.QueueJob) error {
 
 	deleted := 0
 	for _, r := range pending {
-		// In-flight receipts cannot transition to deleted (state machine);
-		// the next sweep picks them up once processing settles.
-		if r.Status == domain.ReceiptDownloading || r.Status == domain.ReceiptExtracting {
+		if r.Status == domain.ReceiptQueued || r.Status == domain.ReceiptStored ||
+			r.Status == domain.ReceiptDownloading || r.Status == domain.ReceiptExtracting ||
+			r.Status == domain.ReceiptFailedTransient || r.Status == domain.ReceiptReceived {
 			continue
 		}
 		if r.StorageKey != "" {

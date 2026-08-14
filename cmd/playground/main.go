@@ -47,6 +47,7 @@ import (
 	"zl-expese-bot/internal/platform/queue"
 	"zl-expese-bot/internal/receipt"
 	"zl-expese-bot/internal/store"
+	"zl-expese-bot/internal/worker"
 )
 
 //go:embed static/*
@@ -108,14 +109,14 @@ func run() error {
 	provider := logprovider.New(log)
 	replies := notify.NewEnqueuer(st, q, clk)
 	cats := categorisation.NewService(st, clk)
-	insights := insight.NewService(pool, clk)
+	insights := insight.NewService(st)
 	processor := receipt.NewProcessor(st, objects, mock.New(), provider, cats, replies, clk, log)
 	processor.ExtractionEnabled = true
 	processor.MonthlyOCRLimit = 0 // the embedded mock has no external cost
 	sender := notify.NewSender(st, provider, clk, log, true, 0)
 	play := &playgroundServer{
 		pool: pool, st: st, q: q, provider: provider, processor: processor, sender: sender,
-		handler: bot.NewHandler(st, pool, q, objects, replies, cats, insights, clk, log, cfg),
+		handler: bot.NewHandler(st, q, objects, replies, cats, insights, clk, log, cfg),
 	}
 
 	assets, err := fs.Sub(staticFiles, "static")
@@ -268,7 +269,10 @@ func (s *playgroundServer) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "Bot xử lý thất bại: "+err.Error())
 		return
 	}
-	if err := s.drain(r.Context()); err != nil {
+	if err := worker.Drain(r.Context(), s.q, []worker.DrainStep{
+		{Kind: domain.JobReceiptProcess, Handle: s.processor.Handle},
+		{Kind: domain.JobOutboundSend, Handle: s.sender.Handle},
+	}); err != nil {
 		writeError(w, http.StatusInternalServerError, "Hàng đợi xử lý thất bại: "+err.Error())
 		return
 	}
@@ -312,43 +316,6 @@ func (s *playgroundServer) profile(ctx context.Context, subject string) (*profil
 		})
 	}
 	return view, nil
-}
-
-func (s *playgroundServer) drain(ctx context.Context) error {
-	for {
-		receipts, err := s.drainKind(ctx, domain.JobReceiptProcess, s.processor.Handle)
-		if err != nil {
-			return err
-		}
-		outbound, err := s.drainKind(ctx, domain.JobOutboundSend, s.sender.Handle)
-		if err != nil {
-			return err
-		}
-		if receipts+outbound == 0 {
-			return nil
-		}
-	}
-}
-
-func (s *playgroundServer) drainKind(ctx context.Context, kind domain.JobKind, handle func(context.Context, *domain.QueueJob) error) (int, error) {
-	count := 0
-	for {
-		job, err := s.q.Dequeue(ctx, []domain.JobKind{kind}, 30*time.Second)
-		if errors.Is(err, queue.ErrEmpty) {
-			return count, nil
-		}
-		if err != nil {
-			return count, err
-		}
-		count++
-		if err := handle(ctx, job); err != nil {
-			_ = s.q.Nack(ctx, job.ID, job.ClaimToken, err)
-			return count, err
-		}
-		if err := s.q.Ack(ctx, job.ID, job.ClaimToken); err != nil {
-			return count, err
-		}
-	}
 }
 
 func (s *playgroundServer) health(w http.ResponseWriter, r *http.Request) {

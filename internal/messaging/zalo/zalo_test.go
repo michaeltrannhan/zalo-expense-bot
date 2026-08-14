@@ -474,6 +474,52 @@ func TestGetMe(t *testing.T) {
 	})
 }
 
+func TestSetMyCommands(t *testing.T) {
+	t.Run("posts telegram-shaped command list", func(t *testing.T) {
+		var gotBody []byte
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/botT0K3N/setMyCommands" {
+				t.Errorf("request = %s %s", r.Method, r.URL.Path)
+			}
+			gotBody, _ = io.ReadAll(r.Body)
+			fmt.Fprint(w, `{"ok":true,"result":true}`)
+		}))
+		defer srv.Close()
+		cmds := []Command{{Command: "help", Description: "Hướng dẫn"}, {Command: "today", Description: "Chi tiêu hôm nay"}}
+		if err := New(Config{Token: "T0K3N", APIBase: srv.URL}).SetMyCommands(context.Background(), cmds); err != nil {
+			t.Fatalf("SetMyCommands: %v", err)
+		}
+		var sent struct {
+			Commands []Command `json:"commands"`
+		}
+		if err := json.Unmarshal(gotBody, &sent); err != nil {
+			t.Fatalf("body: %v", err)
+		}
+		if len(sent.Commands) != 2 || sent.Commands[0].Command != "help" || strings.HasPrefix(sent.Commands[0].Command, "/") {
+			t.Errorf("commands = %+v", sent.Commands)
+		}
+	})
+
+	t.Run("missing token", func(t *testing.T) {
+		err := New(Config{}).SetMyCommands(context.Background(), []Command{{Command: "help", Description: "x"}})
+		if !domain.IsCode(err, domain.CodeValidation) {
+			t.Fatalf("err = %v, want CodeValidation", err)
+		}
+	})
+
+	t.Run("unknown method is fail-open class", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"ok":false,"description":"Not Found"}`)
+		}))
+		defer srv.Close()
+		err := New(Config{Token: "T0K3N", APIBase: srv.URL}).SetMyCommands(context.Background(), []Command{{Command: "help", Description: "x"}})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+}
+
 func TestGetUpdatesTimeoutIsEmptyResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {

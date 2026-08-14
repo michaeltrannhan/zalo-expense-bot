@@ -61,7 +61,7 @@ func TestRunnerEnqueuesAndAdvancesDueDailySummary(t *testing.T) {
 	q := queue.NewPG(pool, clk)
 	replies := notify.NewEnqueuer(st, q, clk)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	runner := NewRunner(st, insight.NewService(pool, clk), replies, clk, log)
+	runner := NewRunner(st, insight.NewService(st), replies, clk, log)
 	processed, err := runner.RunOnce(ctx)
 	if err != nil {
 		t.Fatal(err)

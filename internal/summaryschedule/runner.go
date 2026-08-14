@@ -96,10 +96,7 @@ func (r *Runner) processLocked(ctx context.Context, preference *domain.SummarySc
 	if user.Status != domain.UserActive || user.DeletedAt != nil {
 		return nil
 	}
-	loc := time.UTC
-	if loaded, loadErr := time.LoadLocation(user.Timezone); loadErr == nil {
-		loc = loaded
-	}
+	loc := user.Location()
 	scheduledFor, err := LatestDelivery(now, loc, preference.Frequency, preference.DeliveryMinute)
 	if err != nil {
 		return domain.E(domain.CodeValidation, "calculate latest summary delivery", err)

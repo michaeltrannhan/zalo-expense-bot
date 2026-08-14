@@ -15,7 +15,7 @@ import (
 )
 
 // handleText resolves pending chat state first, then fresh intents. Slash
-// commands always win over a pending action — asking for /homnay must not
+// commands always win over a pending action — asking for /today must not
 // be swallowed by a stale confirmation card.
 func (h *Handler) handleText(ctx context.Context, user *domain.User, ev events.InboundEvent, pm *domain.ProviderMessage) error {
 	intent := conversation.Parse(ev.Text)
@@ -36,7 +36,7 @@ func (h *Handler) handleText(ctx context.Context, user *domain.User, ev events.I
 	case conversation.IntentStart, conversation.IntentHelp:
 		return h.reply(ctx, user.ID, ev, conversation.HelpText(), "cmd:"+pm.ID.String())
 	case conversation.IntentPrivacy:
-		return h.reply(ctx, user.ID, ev, conversation.PrivacyText(), "cmd:"+pm.ID.String())
+		return h.reply(ctx, user.ID, ev, conversation.PrivacyText(h.cfg.OriginalRetentionDays, h.cfg.ExtractionBackend), "cmd:"+pm.ID.String())
 	case conversation.IntentToday:
 		return h.summary(ctx, user, ev, pm, periodToday)
 	case conversation.IntentWeek:
@@ -372,16 +372,11 @@ func (h *Handler) categoryName(ctx context.Context, id *uuid.UUID) string {
 	if id == nil {
 		return ""
 	}
-	cats, err := h.st.ListCategories(ctx)
+	cat, err := h.st.GetCategoryByID(ctx, *id)
 	if err != nil {
 		return ""
 	}
-	for _, c := range cats {
-		if c.ID == *id {
-			return c.DisplayName
-		}
-	}
-	return ""
+	return cat.DisplayName
 }
 
 // matchCategory resolves free text against the taxonomy: a 1-based number

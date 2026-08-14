@@ -141,3 +141,49 @@ func runWithHeartbeat(ctx context.Context, q queue.Queue, job *domain.QueueJob, 
 
 	return handle(ctx, job)
 }
+
+// DrainStep is one kind/handler pair for Drain.
+type DrainStep struct {
+	Kind   domain.JobKind
+	Handle Handler
+}
+
+// Drain processes queued jobs in dependency order until a full pass finds
+// none. Any handler error aborts: local harnesses are deterministic, so an
+// error is a bug to surface, not a condition to retry.
+func Drain(ctx context.Context, q queue.Queue, steps []DrainStep) error {
+	for {
+		n := 0
+		for _, step := range steps {
+			c, err := drainKind(ctx, q, step.Kind, step.Handle)
+			if err != nil {
+				return err
+			}
+			n += c
+		}
+		if n == 0 {
+			return nil
+		}
+	}
+}
+
+func drainKind(ctx context.Context, q queue.Queue, kind domain.JobKind, handle Handler) (int, error) {
+	n := 0
+	for {
+		job, err := q.Dequeue(ctx, []domain.JobKind{kind}, 30*time.Second)
+		if errors.Is(err, queue.ErrEmpty) {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+		n++
+		if err := handle(ctx, job); err != nil {
+			_ = q.Nack(ctx, job.ID, job.ClaimToken, err)
+			return n, err
+		}
+		if err := q.Ack(ctx, job.ID, job.ClaimToken); err != nil {
+			return n, err
+		}
+	}
+}

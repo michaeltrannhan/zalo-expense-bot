@@ -14,7 +14,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -43,6 +42,7 @@ import (
 	"zl-expese-bot/internal/platform/queue"
 	"zl-expese-bot/internal/receipt"
 	"zl-expese-bot/internal/store"
+	"zl-expese-bot/internal/worker"
 )
 
 // demoSender/demoChat are the fixed sender identity; reruns reuse the same
@@ -121,7 +121,7 @@ func run() error {
 	provider := logprovider.New(log)
 	replies := notify.NewEnqueuer(st, q, clk)
 	cats := categorisation.NewService(st, clk)
-	insights := insight.NewService(pool, clk)
+	insights := insight.NewService(st)
 
 	processor := receipt.NewProcessor(st, objects, mock.New(), provider, cats, replies, clk, log)
 	processor.ExtractionEnabled = cfg.ExtractionEnabled
@@ -130,7 +130,7 @@ func run() error {
 	h := &harness{
 		ctx:       ctx,
 		pool:      pool,
-		handler:   bot.NewHandler(st, pool, q, objects, replies, cats, insights, clk, log, cfg),
+		handler:   bot.NewHandler(st, q, objects, replies, cats, insights, clk, log, cfg),
 		processor: processor,
 		sender:    notify.NewSender(st, provider, clk, log, cfg.OutboundEnabled, cfg.ZaloMonthlyMessageLimit),
 		provider:  provider,
@@ -297,7 +297,10 @@ func (h *harness) deliver(ev events.InboundEvent) error {
 	if err := h.handler.HandleEvent(h.ctx, ev); err != nil {
 		return fmt.Errorf("handle %s %s: %w", ev.EventType, ev.ProviderMessageID, err)
 	}
-	return h.drain()
+	return worker.Drain(h.ctx, h.q, []worker.DrainStep{
+		{Kind: domain.JobReceiptProcess, Handle: h.processor.Handle},
+		{Kind: domain.JobOutboundSend, Handle: h.sender.Handle},
+	})
 }
 
 // textEvent builds a normalised inbound text event.
@@ -338,48 +341,6 @@ func (h *harness) event(eventType, text string, media []events.MediaReference) e
 	ev.RawPayload = raw
 	ev.RawPayloadHash = hex.EncodeToString(sum[:])
 	return ev
-}
-
-// drain processes queued receipt and outbound jobs until both are empty,
-// in dependency order (receipt jobs enqueue outbound jobs).
-func (h *harness) drain() error {
-	for {
-		r, err := h.drainKind(domain.JobReceiptProcess, h.processor.Handle)
-		if err != nil {
-			return err
-		}
-		o, err := h.drainKind(domain.JobOutboundSend, h.sender.Handle)
-		if err != nil {
-			return err
-		}
-		if r+o == 0 {
-			return nil
-		}
-	}
-}
-
-// drainKind handles every currently-visible job of one kind. Any handler
-// error aborts the demo: this environment is deterministic, so an error is
-// a bug to surface, not a condition to retry.
-func (h *harness) drainKind(kind domain.JobKind, handle func(context.Context, *domain.QueueJob) error) (int, error) {
-	n := 0
-	for {
-		job, err := h.q.Dequeue(h.ctx, []domain.JobKind{kind}, 30*time.Second)
-		if errors.Is(err, queue.ErrEmpty) {
-			return n, nil
-		}
-		if err != nil {
-			return n, fmt.Errorf("dequeue %s: %w", kind, err)
-		}
-		n++
-		if err := handle(h.ctx, job); err != nil {
-			_ = h.q.Nack(h.ctx, job.ID, job.ClaimToken, err)
-			return n, fmt.Errorf("%s job: %w", kind, err)
-		}
-		if err := h.q.Ack(h.ctx, job.ID, job.ClaimToken); err != nil {
-			return n, fmt.Errorf("ack %s job: %w", kind, err)
-		}
-	}
 }
 
 // check records one assertion.

@@ -6,16 +6,14 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"io"
 	"strconv"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zl-expese-bot/internal/domain"
+	"zl-expese-bot/internal/store"
 )
 
 var csvHeader = []string{
@@ -23,59 +21,33 @@ var csvHeader = []string{
 	"amount_minor", "currency", "category_key", "status", "source",
 }
 
-// ExportTransactionsCSV writes every non-deleted transaction belonging to
-// userID to w as CSV, ordered by occurred_at (then id). Timestamps are
-// RFC3339 UTC and amounts are integer minor units. It returns the number of
-// data rows written (header excluded).
-func ExportTransactionsCSV(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID, w io.Writer) (int, error) {
-	rows, err := pool.Query(ctx, `
-		SELECT t.id, t.occurred_at, t.type, t.merchant_name, t.description,
-		       t.amount_minor, t.currency, COALESCE(c.system_key, ''), t.status, t.source
-		FROM transactions t
-		LEFT JOIN categories c ON c.id = t.category_id
-		WHERE t.user_id = $1 AND t.deleted_at IS NULL
-		ORDER BY t.occurred_at ASC, t.id ASC`, userID)
+// ExportTransactionsCSV writes every confirmed/amended, non-deleted
+// transaction belonging to userID to w as CSV, ordered by occurred_at
+// (then id). Timestamps are RFC3339 UTC and amounts are integer minor
+// units. It returns the number of data rows written (header excluded).
+func ExportTransactionsCSV(ctx context.Context, st *store.Store, userID uuid.UUID, w io.Writer) (int, error) {
+	rows, err := st.ListExportTransactions(ctx, userID)
 	if err != nil {
-		return 0, domain.E(domain.CodeTransient, "query transactions for export", err)
+		return 0, err
 	}
-	defer rows.Close()
 
 	cw := csv.NewWriter(w)
 	if err := cw.Write(csvHeader); err != nil {
 		return 0, domain.E(domain.CodeTransient, "write csv header", err)
 	}
 	n := 0
-	for rows.Next() {
-		var (
-			id          uuid.UUID
-			occurredAt  time.Time
-			amountMinor int64
-			txType      string
-			merchant    string
-			description string
-			currency    string
-			categoryKey string
-			status      string
-			source      string
-		)
-		if err := rows.Scan(&id, &occurredAt, &txType, &merchant, &description,
-			&amountMinor, &currency, &categoryKey, &status, &source); err != nil {
-			return n, domain.E(domain.CodeTransient, "scan transaction export row", err)
-		}
+	for _, row := range rows {
 		rec := []string{
-			id.String(),
-			occurredAt.UTC().Format(time.RFC3339),
-			txType, merchant, description,
-			strconv.FormatInt(amountMinor, 10),
-			currency, categoryKey, status, source,
+			row.ID.String(),
+			row.OccurredAt.UTC().Format(time.RFC3339),
+			row.Type, row.Merchant, row.Description,
+			strconv.FormatInt(row.AmountMinor, 10),
+			row.Currency, row.CategoryKey, row.Status, row.Source,
 		}
 		if err := cw.Write(rec); err != nil {
 			return n, domain.E(domain.CodeTransient, "write csv row", err)
 		}
 		n++
-	}
-	if err := rows.Err(); err != nil {
-		return n, domain.E(domain.CodeTransient, "iterate transactions export", err)
 	}
 	cw.Flush()
 	if err := cw.Error(); err != nil {
@@ -141,83 +113,50 @@ type Counts struct {
 
 // ExportMetadataJSON writes the user's account metadata to w as indented
 // JSON. It returns domain.CodeNotFound when the user does not exist.
-func ExportMetadataJSON(ctx context.Context, pool *pgxpool.Pool, userID uuid.UUID, w io.Writer) error {
+func ExportMetadataJSON(ctx context.Context, st *store.Store, userID uuid.UUID, w io.Writer) error {
+	meta, err := st.LoadAccountExport(ctx, userID)
+	if err != nil {
+		return err
+	}
+
 	doc := MetadataExport{
-		ExportedAt:       time.Now().UTC(),
+		ExportedAt: time.Now().UTC(),
+		User: MetadataUser{
+			ID: meta.User.ID, Status: string(meta.User.Status),
+			Timezone: meta.User.Timezone, DefaultCurrency: meta.User.DefaultCurrency,
+			Locale: meta.User.Locale, CreatedAt: meta.User.CreatedAt,
+			UpdatedAt: meta.User.UpdatedAt, DeletedAt: meta.User.DeletedAt,
+		},
+		Consent: Consent{
+			Version:     meta.User.ConsentVersion,
+			ConsentedAt: meta.User.ConsentedAt,
+		},
 		Identities:       []Identity{},
 		SummarySchedules: []SummarySchedule{},
+		Counts: Counts{
+			Transactions:     meta.TransactionCount,
+			Receipts:         meta.ReceiptCount,
+			Insights:         meta.InsightCount,
+			SummarySchedules: meta.ScheduleCount,
+		},
 	}
-
-	err := pool.QueryRow(ctx, `
-		SELECT id, status, timezone, default_currency, locale,
-		       consent_version, consented_at, created_at, updated_at, deleted_at
-		FROM users WHERE id = $1`, userID).
-		Scan(&doc.User.ID, &doc.User.Status, &doc.User.Timezone,
-			&doc.User.DefaultCurrency, &doc.User.Locale,
-			&doc.Consent.Version, &doc.Consent.ConsentedAt,
-			&doc.User.CreatedAt, &doc.User.UpdatedAt, &doc.User.DeletedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.Ef(domain.CodeNotFound, nil, "user %s not found", userID)
+	for _, ident := range meta.Identities {
+		doc.Identities = append(doc.Identities, Identity{
+			Provider:        string(ident.Provider),
+			ProviderSubject: ident.ProviderSubject,
+			ProviderScope:   ident.ProviderScope,
+		})
 	}
-	if err != nil {
-		return domain.E(domain.CodeTransient, "load user for metadata export", err)
-	}
-
-	rows, err := pool.Query(ctx, `
-		SELECT provider, provider_subject, provider_scope
-		FROM user_identities WHERE user_id = $1
-		ORDER BY provider, provider_subject`, userID)
-	if err != nil {
-		return domain.E(domain.CodeTransient, "query identities for metadata export", err)
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id Identity
-		if err := rows.Scan(&id.Provider, &id.ProviderSubject, &id.ProviderScope); err != nil {
-			return domain.E(domain.CodeTransient, "scan identity export row", err)
-		}
-		doc.Identities = append(doc.Identities, id)
-	}
-	if err := rows.Err(); err != nil {
-		return domain.E(domain.CodeTransient, "iterate identities export", err)
-	}
-
-	scheduleRows, err := pool.Query(ctx, `
-		SELECT frequency, delivery_minute, provider, provider_chat_id,
-		       enabled, next_delivery_at, last_delivered_at
-		FROM scheduled_summary_preferences
-		WHERE user_id = $1
-		ORDER BY frequency`, userID)
-	if err != nil {
-		return domain.E(domain.CodeTransient, "query summary schedules for metadata export", err)
-	}
-	defer scheduleRows.Close()
-	for scheduleRows.Next() {
-		var preference SummarySchedule
-		if err := scheduleRows.Scan(&preference.Frequency, &preference.DeliveryMinute,
-			&preference.Provider, &preference.ProviderChatID, &preference.Enabled,
-			&preference.NextDeliveryAt, &preference.LastDeliveredAt); err != nil {
-			return domain.E(domain.CodeTransient, "scan summary schedule export row", err)
-		}
-		doc.SummarySchedules = append(doc.SummarySchedules, preference)
-	}
-	if err := scheduleRows.Err(); err != nil {
-		return domain.E(domain.CodeTransient, "iterate summary schedule export", err)
-	}
-
-	err = pool.QueryRow(ctx, `
-		SELECT
-		  (SELECT COUNT(*)::int FROM transactions
-		    WHERE user_id = $1 AND deleted_at IS NULL),
-		  (SELECT COUNT(*)::int FROM receipt_documents
-		    WHERE user_id = $1 AND deleted_at IS NULL),
-		  (SELECT COUNT(*)::int FROM insights WHERE user_id = $1),
-		  (SELECT COUNT(*)::int FROM scheduled_summary_preferences
-		    WHERE user_id = $1)`, userID).
-		Scan(&doc.Counts.Transactions, &doc.Counts.Receipts, &doc.Counts.Insights,
-			&doc.Counts.SummarySchedules)
-	if err != nil {
-		return domain.E(domain.CodeTransient, "count records for metadata export", err)
+	for _, preference := range meta.SummarySchedules {
+		doc.SummarySchedules = append(doc.SummarySchedules, SummarySchedule{
+			Frequency:       string(preference.Frequency),
+			DeliveryMinute:  preference.DeliveryMinute,
+			Provider:        string(preference.Provider),
+			ProviderChatID:  preference.ProviderChatID,
+			Enabled:         preference.Enabled,
+			NextDeliveryAt:  preference.NextDeliveryAt,
+			LastDeliveredAt: preference.LastDeliveredAt,
+		})
 	}
 
 	enc := json.NewEncoder(w)

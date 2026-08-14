@@ -1,9 +1,13 @@
 package gemini
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -66,6 +70,9 @@ func TestExtractMapsAnswerDeterministically(t *testing.T) {
 	}
 	if sent.GenerationConfig.ResponseMimeType != "application/json" {
 		t.Errorf("generation config = %+v", sent.GenerationConfig)
+	}
+	if sent.GenerationConfig.ThinkingConfig == nil || sent.GenerationConfig.ThinkingConfig.ThinkingLevel != "minimal" {
+		t.Errorf("thinkingConfig = %+v, want minimal (default medium thinking is the OCR latency)", sent.GenerationConfig.ThinkingConfig)
 	}
 	if sent.Contents[0].Parts[0].Text == "" {
 		t.Fatal("prompt must precede the image part")
@@ -217,5 +224,69 @@ func TestExtractMalformedModelJSON(t *testing.T) {
 	_, err := ex.Extract(context.Background(), strings.NewReader("img"), extraction.Input{})
 	if !domain.IsCode(err, domain.CodeTransient) {
 		t.Errorf("malformed model JSON = %v, want CodeTransient", err)
+	}
+}
+
+func TestDownscaleForOCRShrinksLargeJPEG(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 3200, 2400))
+	src.Set(0, 0, color.RGBA{R: 255, A: 255})
+	var raw bytes.Buffer
+	if err := jpeg.Encode(&raw, src, &jpeg.Options{Quality: 95}); err != nil {
+		t.Fatal(err)
+	}
+	out, mime, ok := downscaleForOCR(raw.Bytes())
+	if !ok {
+		t.Fatalf("downscaleForOCR skipped a %dx%d JPEG (%d bytes)", src.Bounds().Dx(), src.Bounds().Dy(), raw.Len())
+	}
+	if mime != "image/jpeg" {
+		t.Errorf("mime = %q", mime)
+	}
+	decoded, err := jpeg.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, h := decoded.Bounds().Dx(), decoded.Bounds().Dy()
+	if w > ocrMaxEdge || h > ocrMaxEdge {
+		t.Errorf("scaled %dx%d exceeds max edge %d", w, h, ocrMaxEdge)
+	}
+	if w < ocrMaxEdge && h < ocrMaxEdge {
+		t.Errorf("scaled %dx%d should keep one edge at %d", w, h, ocrMaxEdge)
+	}
+	if len(out) >= raw.Len() {
+		t.Errorf("scaled payload %d bytes was not smaller than original %d", len(out), raw.Len())
+	}
+}
+
+func TestDownscaleForOCRLeavesUndecodableBytes(t *testing.T) {
+	if _, _, ok := downscaleForOCR([]byte("not an image")); ok {
+		t.Fatal("undecodable bytes must pass through unchanged")
+	}
+}
+
+func TestExtractSendsDownscaledImage(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 3000, 2000))
+	var raw bytes.Buffer
+	if err := jpeg.Encode(&raw, src, &jpeg.Options{Quality: 90}); err != nil {
+		t.Fatal(err)
+	}
+	ex, reqBody := fakeGemini(t, http.StatusOK, receiptAnswer)
+	_, err := ex.Extract(context.Background(), bytes.NewReader(raw.Bytes()), extraction.Input{ContentType: "image/jpeg"})
+	if err != nil {
+		t.Fatalf("Extract: %v", err)
+	}
+	var sent generateRequest
+	if err := json.Unmarshal(reqBody(), &sent); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(sent.Contents[0].Parts[1].InlineData.Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := jpeg.Decode(bytes.NewReader(decoded))
+	if err != nil {
+		t.Fatalf("gemini payload is not jpeg: %v", err)
+	}
+	if img.Bounds().Dx() > ocrMaxEdge || img.Bounds().Dy() > ocrMaxEdge {
+		t.Errorf("uploaded image %v exceeds OCR max edge", img.Bounds())
 	}
 }

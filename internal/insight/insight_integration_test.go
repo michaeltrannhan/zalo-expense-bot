@@ -13,8 +13,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"zl-expese-bot/internal/domain"
-	"zl-expese-bot/internal/platform/clock"
 	"zl-expese-bot/internal/platform/postgres/pgtest"
+	"zl-expese-bot/internal/store"
 )
 
 // Fixed category UUIDs from db/migrations/0002_seed_categories.up.sql.
@@ -134,7 +134,7 @@ func seedTwoUsers(t *testing.T, pool *pgxpool.Pool) {
 func TestPersistStoresEvidenceBackedRow(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	seedTwoUsers(t, pool)
-	svc := NewService(pool, clock.Real{})
+	svc := NewService(store.New(pool))
 	ctx := context.Background()
 
 	sum, err := svc.Summarise(ctx, user1, weekPeriod)
@@ -200,7 +200,7 @@ func TestPersistStoresEvidenceBackedRow(t *testing.T) {
 func TestSummariseIntegration(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	seedTwoUsers(t, pool)
-	svc := NewService(pool, clock.Real{})
+	svc := NewService(store.New(pool))
 
 	t.Run("user1 this week", func(t *testing.T) {
 		sum, err := svc.Summarise(context.Background(), user1, weekPeriod)
@@ -325,15 +325,14 @@ func TestSummariseIntegration(t *testing.T) {
 func TestRecordIntegration(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	seedTwoUsers(t, pool)
-	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
-	svc := NewService(pool, clock.Fixed{T: now})
+	svc := NewService(store.New(pool))
 
 	sum, err := svc.Summarise(context.Background(), user1, weekPeriod)
 	if err != nil {
 		t.Fatalf("Summarise: %v", err)
 	}
-	if err := svc.Record(context.Background(), user1, "weekly", weekPeriod, sum); err != nil {
-		t.Fatalf("Record: %v", err)
+	if err := svc.Persist(context.Background(), user1, "weekly", weekPeriod, sum); err != nil {
+		t.Fatalf("Persist: %v", err)
 	}
 
 	var (
@@ -369,8 +368,8 @@ func TestRecordIntegration(t *testing.T) {
 	if status != "ready" {
 		t.Errorf("status = %q, want ready", status)
 	}
-	if !createdAt.Equal(now) {
-		t.Errorf("created_at = %s, want %s (fixed clock)", createdAt, now)
+	if createdAt.IsZero() {
+		t.Error("created_at is zero")
 	}
 
 	var gotSummary Summary

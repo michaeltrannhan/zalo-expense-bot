@@ -53,7 +53,7 @@ func TestFailedImageWebhookRetryResumesSinglePipeline(t *testing.T) {
 	retryingQueue := &failFirstReceiptEnqueue{Queue: baseQueue}
 	replies := notify.NewEnqueuer(st, retryingQueue, clk)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := NewHandler(st, pool, retryingQueue, nil, replies, nil, nil, clk, log, config.Config{
+	handler := NewHandler(st, retryingQueue, nil, replies, nil, nil, clk, log, config.Config{
 		PerUserDailyReceiptLimit: 20,
 	})
 
@@ -153,7 +153,7 @@ func TestDeletionConfirmationReplayDoesNotRecreateAccount(t *testing.T) {
 	q := queue.NewPG(pool, clk)
 	replies := notify.NewEnqueuer(st, q, clk)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := NewHandler(st, pool, q, nil, replies, nil, nil, clk, log, config.Config{
+	handler := NewHandler(st, q, nil, replies, nil, nil, clk, log, config.Config{
 		AppEnv:  config.EnvDevelopment,
 		DataDir: t.TempDir(),
 	})
@@ -222,8 +222,8 @@ func TestSettingsUpdateProfileScheduleAndManualCurrency(t *testing.T) {
 	q := queue.NewPG(pool, clk)
 	replies := notify.NewEnqueuer(st, q, clk)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := NewHandler(st, pool, q, nil, replies,
-		categorisation.NewService(st, clk), insight.NewService(pool, clk), clk, log,
+	handler := NewHandler(st, q, nil, replies,
+		categorisation.NewService(st, clk), insight.NewService(st), clk, log,
 		config.Config{AppEnv: config.EnvDevelopment})
 
 	userID := uuid.New()
