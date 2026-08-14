@@ -41,7 +41,10 @@ func (q *failOutboundEnqueue) Enqueue(ctx context.Context, kind domain.JobKind, 
 func testHandler(t *testing.T, pool *pgxpool.Pool, q queue.Queue, cfg config.Config) (*Handler, *store.Store, clock.Fixed) {
 	t.Helper()
 	st := store.New(pool)
-	now := time.Date(2026, 8, 13, 4, 0, 0, 0, time.UTC)
+	// Use a wall-clock-relative instant rather than a hardcoded date: the
+	// store's pending-action expiry check compares against time.Now(), so a
+	// fixed date in the past makes every pending action appear expired.
+	now := time.Now().UTC().Add(time.Hour)
 	clk := clock.Fixed{T: now}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	replies := notify.NewEnqueuer(st, q, clk)

@@ -36,8 +36,8 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/zl_expense?sslmode=disable
       ZALO_WEBHOOK_SECRET: ci-only-secret
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
