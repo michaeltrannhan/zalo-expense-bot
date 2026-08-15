@@ -204,7 +204,8 @@ func stripSeparators(s string) string {
 func detectCurrency(s, hint string) (currency, rest string) {
 	upper := strings.ToUpper(s)
 	switch {
-	case strings.Contains(upper, "VNĐ"), strings.Contains(upper, "VND"),
+	case strings.Contains(upper, "ĐỒNG"), strings.Contains(upper, "DONG"),
+		strings.Contains(upper, "VNĐ"), strings.Contains(upper, "VND"),
 		strings.Contains(s, "đ"), strings.Contains(s, "Đ"), strings.Contains(s, "₫"):
 		currency = "VND"
 	case strings.Contains(upper, "AUD"):
@@ -225,8 +226,12 @@ func detectCurrency(s, hint string) (currency, rest string) {
 	}
 
 	// Remove currency tokens so only digits/separators/multiplier remain.
+	// Strip "đồng"/"dong" before a lone "đ", or "325.000 đồng" becomes "ồng".
 	rest = s
-	for _, tok := range []string{"VNĐ", "VND", "vnđ", "vnd", "AUD", "aud", "A$", "a$", "$", "₫", "đ", "Đ"} {
+	for _, tok := range []string{
+		"đồng", "Đồng", "ĐỒNG", "DONG", "Dong", "dong",
+		"VNĐ", "VND", "vnđ", "vnd", "AUD", "aud", "A$", "a$", "$", "₫", "đ", "Đ",
+	} {
 		rest = strings.ReplaceAll(rest, tok, "")
 	}
 	return currency, strings.TrimSpace(rest)

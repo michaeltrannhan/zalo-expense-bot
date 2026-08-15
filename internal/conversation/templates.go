@@ -329,6 +329,12 @@ func ExtractionFailedText() string {
 	return `Tôi không đọc được ảnh này. Bạn có thể gửi ảnh rõ hơn, hoặc nhập tay: "an sang 500k".`
 }
 
+// MissingAmountText is used when the image is a receipt but the total
+// could not be parsed. Asking for the amount is better than "can't read".
+func MissingAmountText() string {
+	return `Tôi thấy hóa đơn nhưng chưa đọc được số tiền. Bạn nhập tay giúp, ví dụ: "an sang 85k".`
+}
+
 // ConfirmedText acknowledges a confirmed transaction, e.g.
 // "Đã ghi nhận: 325.000 ₫ tại Co.opmart (Thực phẩm)."
 func ConfirmedText(amount, merchant, category string) string {

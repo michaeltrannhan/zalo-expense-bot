@@ -219,6 +219,44 @@ func TestExtractHTTPErrorClassification(t *testing.T) {
 	}
 }
 
+func TestExtractRetriesWithoutThinkingOnRejection(t *testing.T) {
+	var calls int
+	var lastBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastBody, _ = io.ReadAll(r.Body)
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		if calls == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"thinkingLevel is not supported"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"candidates": []any{
+				map[string]any{"content": map[string]any{
+					"parts": []any{map[string]any{"text": receiptAnswer}},
+				}},
+			},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	ex := New(Config{APIKey: "test-key", Model: "gemini-3.6-flash", APIBase: srv.URL})
+	if _, err := ex.Extract(context.Background(), strings.NewReader("img"), extraction.Input{ContentType: "image/jpeg"}); err != nil {
+		t.Fatalf("Extract after thinking fallback: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	var sent generateRequest
+	if err := json.Unmarshal(lastBody, &sent); err != nil {
+		t.Fatal(err)
+	}
+	if sent.GenerationConfig.ThinkingConfig != nil {
+		t.Fatalf("retry must omit thinkingConfig, got %+v", sent.GenerationConfig.ThinkingConfig)
+	}
+}
+
 func TestExtractMalformedModelJSON(t *testing.T) {
 	ex, _ := fakeGemini(t, http.StatusOK, "this is not json")
 	_, err := ex.Extract(context.Background(), strings.NewReader("img"), extraction.Input{})

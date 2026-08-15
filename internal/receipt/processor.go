@@ -88,6 +88,9 @@ func (p *Processor) Handle(ctx context.Context, job *domain.QueueJob) error {
 	data, digest, contentType, err := p.loadImageBytes(ctx, prep)
 	if err != nil {
 		return p.withLockedReceipt(ctx, payload, func(lockedCtx context.Context, r *domain.ReceiptDocument) error {
+			p.log.Warn("receipt image load failed",
+				slog.String("receipt_id", r.ID.String()),
+				slog.String("error", err.Error()))
 			if domain.IsCode(err, domain.CodeConflict) {
 				return p.conflictAsDone(lockedCtx, r.ID, err)
 			}
@@ -295,6 +298,9 @@ func (p *Processor) finishExtraction(ctx context.Context, payload events.Receipt
 	}
 
 	if extractErr != nil {
+		p.log.Warn("receipt extraction failed",
+			slog.String("receipt_id", r.ID.String()),
+			slog.String("error", extractErr.Error()))
 		if domain.IsCode(extractErr, domain.CodeUnsupported) {
 			return p.failWith(ctx, r, payload, attempt, "unsupported", conversation.UnsupportedImageText())
 		}
@@ -305,6 +311,12 @@ func (p *Processor) finishExtraction(ctx context.Context, payload events.Receipt
 	if err != nil {
 		if domain.IsCode(err, domain.CodeConflict) {
 			return p.conflictAsDone(ctx, r.ID, err)
+		}
+		p.log.Warn("receipt draft persist failed",
+			slog.String("receipt_id", r.ID.String()),
+			slog.String("error", err.Error()))
+		if strings.Contains(err.Error(), "missing total_minor") {
+			return p.fail(ctx, r, payload, attempt, err, conversation.MissingAmountText())
 		}
 		return p.fail(ctx, r, payload, attempt, err, "")
 	}
@@ -525,7 +537,7 @@ func (p *Processor) fail(ctx context.Context, r *domain.ReceiptDocument, payload
 	if msg == "" {
 		msg = conversation.ExtractionFailedText()
 	}
-	return p.failWith(ctx, r, payload, attempt, string(domain.CodeOf(cause)), msg)
+	return p.failWith(ctx, r, payload, attempt, truncateErr(cause), msg)
 }
 
 // failWith records a permanent failure and notifies the user. It returns
@@ -550,6 +562,17 @@ func (p *Processor) failWith(ctx context.Context, r *domain.ReceiptDocument, pay
 		}
 	}
 	return nil
+}
+
+func truncateErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	s := err.Error()
+	if len(s) > 200 {
+		return s[:200]
+	}
+	return s
 }
 
 func receiptTerminal(status domain.ReceiptStatus) bool {

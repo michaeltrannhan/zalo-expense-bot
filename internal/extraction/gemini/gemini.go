@@ -101,7 +101,15 @@ func (e *Extractor) Extract(ctx context.Context, r io.Reader, in extraction.Inpu
 		}
 	}
 
-	body, err := e.buildRequest(data, mime)
+	result, err := e.generate(ctx, data, mime, true)
+	if err != nil && thinkingRejected(err) {
+		result, err = e.generate(ctx, data, mime, false)
+	}
+	return result, err
+}
+
+func (e *Extractor) generate(ctx context.Context, image []byte, mime string, withThinking bool) (events.ExtractionResult, error) {
+	body, err := e.buildRequest(image, mime, withThinking)
 	if err != nil {
 		return events.ExtractionResult{}, domain.E(domain.CodeInternal, "build gemini request", err)
 	}
@@ -133,7 +141,7 @@ func (e *Extractor) Extract(ctx context.Context, r io.Reader, in extraction.Inpu
 
 // buildRequest assembles the generateContent payload: image part + prompt
 // with JSON response mode for stable machine output.
-func (e *Extractor) buildRequest(image []byte, mime string) ([]byte, error) {
+func (e *Extractor) buildRequest(image []byte, mime string, withThinking bool) ([]byte, error) {
 	req := generateRequest{
 		Contents: []content{{
 			Role: "user",
@@ -144,8 +152,10 @@ func (e *Extractor) buildRequest(image []byte, mime string) ([]byte, error) {
 		}},
 		GenerationConfig: generationConfig{
 			ResponseMimeType: "application/json",
-			ThinkingConfig:   &thinkingConfig{ThinkingLevel: "minimal"},
 		},
+	}
+	if withThinking {
+		req.GenerationConfig.ThinkingConfig = &thinkingConfig{ThinkingLevel: "minimal"}
 	}
 	return json.Marshal(req)
 }
@@ -354,4 +364,12 @@ func classifyStatus(status int, body []byte) error {
 	default:
 		return domain.Ef(domain.CodeTransient, nil, "gemini unexpected status %d", status)
 	}
+}
+
+func thinkingRejected(err error) bool {
+	if err == nil || !domain.IsCode(err, domain.CodeValidation) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "thinking")
 }

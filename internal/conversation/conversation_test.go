@@ -288,6 +288,7 @@ func TestTemplateSmoke(t *testing.T) {
 		"MonthlyQuotaText":           MonthlyQuotaText(),
 		"OCRDisabledText":            OCRDisabledText(),
 		"ExtractionFailedText":       ExtractionFailedText(),
+		"MissingAmountText":          MissingAmountText(),
 		"ConfirmedText":              ConfirmedText("325.000 ₫", "Co.opmart", "Thực phẩm"),
 		"DiscardedText":              DiscardedText(),
 		"EditInvalidText":            EditInvalidText(domain.PendingEditTotal),
